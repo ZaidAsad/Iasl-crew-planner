@@ -843,40 +843,62 @@ def tab_timeline():
     ss = st.session_state
     d = derived()
 
-    section_header("Requirement vs availability")
-    sel_fleet = st.selectbox("Fleet", FLEETS, key="tl_fleet")
-    sel_func = st.selectbox("Function", ["Both"] + FUNCTIONS, key="tl_func")
+    section_header("Planning Timeline")
 
-    funcs = FUNCTIONS if sel_func == "Both" else [sel_func]
+    # View controls ----------------------------------------------------------
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+    with c1:
+        sel_fleets = st.multiselect(
+            "Fleets",
+            options=FLEETS,
+            default=FLEETS,
+            key="tl_fleets",
+            placeholder="Choose one or more fleets",
+        )
+    with c2:
+        sel_funcs = st.multiselect(
+            "Functions",
+            options=FUNCTIONS,
+            default=FUNCTIONS,
+            key="tl_funcs",
+        )
+    with c3:
+        view_mode = st.selectbox(
+            "View",
+            options=[
+                "Requirement vs Availability",
+                "Gap (shortfall)",
+                "Nationality split",
+                "Management vs line pilots",
+            ],
+            key="tl_view",
+        )
+    with c4:
+        show_actions = st.checkbox("Mark planned actions",
+                                   value=True, key="tl_show_actions")
 
-    fig = go.Figure()
-    for fn in funcs:
-        req = d["req"][sel_fleet][fn]
-        av  = d["avail"][sel_fleet][fn]
-        fig.add_trace(go.Scatter(
-            x=d["labels"], y=req, name=f"{fn} required",
-            mode="lines", line=dict(dash="dash", width=2,
-                                    color=FLEET_COLORS[sel_fleet]),
-        ))
-        fig.add_trace(go.Scatter(
-            x=d["labels"], y=av, name=f"{fn} available",
-            mode="lines+markers",
-            line=dict(width=2.5, color=FLEET_COLORS[sel_fleet]),
-            fill="tonexty" if len(fig.data) > 0 else None,
-            fillcolor="rgba(239,68,68,0.08)",
-        ))
-    fig.update_layout(
-        height=360, hovermode="x unified",
-        xaxis_title="Month", yaxis_title="Pilots",
-    )
-    fig.update_xaxes(tickangle=-45)
-    st.plotly_chart(fig, use_container_width=True)
+    if not sel_fleets or not sel_funcs:
+        info_panel("Select at least one fleet and one function.")
+        return
 
-    # Overlay of planned actions for this fleet
-    section_header("Planned actions touching this fleet")
-    rel = [a for a in ss.actions if sel_fleet in (a.from_fleet, a.to_fleet)]
+    # Chart ------------------------------------------------------------------
+    if view_mode == "Requirement vs Availability":
+        _tl_req_vs_avail(d, sel_fleets, sel_funcs, show_actions)
+    elif view_mode == "Gap (shortfall)":
+        _tl_gap(d, sel_fleets, sel_funcs, show_actions)
+    elif view_mode == "Nationality split":
+        _tl_nationality(d, sel_fleets, sel_funcs)
+    elif view_mode == "Management vs line pilots":
+        _tl_management(d, sel_fleets, sel_funcs)
+
+    # Planned actions table --------------------------------------------------
+    section_header("Planned actions in view")
+    rel = [
+        a for a in ss.actions
+        if (a.from_fleet in sel_fleets or a.to_fleet in sel_fleets)
+    ]
     if not rel:
-        info_panel("No planned actions touch this fleet.")
+        info_panel("No planned actions touch the selected fleets.")
     else:
         rows = []
         for a in sorted(rel, key=lambda x: x.start_month):
@@ -897,7 +919,7 @@ def tab_timeline():
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # Full grid
+    # Full grid --------------------------------------------------------------
     section_header("Full grid (all fleets, all functions)")
     grid_rows = []
     for f in FLEETS:
@@ -905,11 +927,241 @@ def tab_timeline():
             row = {"Fleet": f, "Function": fn}
             for i, lbl in enumerate(d["labels"]):
                 req = d["req"][f][fn][i]
-                av  = d["avail"][f][fn][i]
+                av = d["avail"][f][fn][i]
                 row[lbl] = f"{req}/{av:.1f}"
             grid_rows.append(row)
     gdf = pd.DataFrame(grid_rows)
     st.dataframe(gdf, use_container_width=True, hide_index=True, height=360)
+
+
+# ---------------------------------------------------------------------------
+# Timeline helpers — fleet colour shading & chart variants
+# ---------------------------------------------------------------------------
+def _hex_to_rgb(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _fleet_function_color(fleet: str, function: str, alpha: float = 1.0) -> str:
+    """
+    Captain = dark shade of the fleet colour.
+    First Officer = light shade of the fleet colour.
+    Returns rgba() string.
+    """
+    base = FLEET_COLORS[fleet]
+    r, g, b = _hex_to_rgb(base)
+    if function == "Captain":
+        # Darken
+        r = int(r * 0.65)
+        g = int(g * 0.65)
+        b = int(b * 0.65)
+    else:
+        # Lighten
+        r = int(r + (255 - r) * 0.45)
+        g = int(g + (255 - g) * 0.45)
+        b = int(b + (255 - b) * 0.45)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _add_action_markers(fig, d, fleets):
+    """Overlay vertical bands for planned actions touching these fleets."""
+    ss = st.session_state
+    acts = [a for a in ss.actions
+            if a.from_fleet in fleets or a.to_fleet in fleets]
+    for a in acts:
+        if a.start_month < 0 or a.start_month >= len(d["labels"]):
+            continue
+        start_lbl = d["labels"][a.start_month]
+        end_idx = min(a.start_month + max(1, a.duration), len(d["labels"]) - 1)
+        end_lbl = d["labels"][end_idx]
+        fig.add_vrect(
+            x0=start_lbl, x1=end_lbl,
+            fillcolor=COLORS["accent"], opacity=0.08,
+            layer="below", line_width=0,
+            annotation_text=a.action_type[:3],
+            annotation_position="top left",
+            annotation_font_size=9,
+            annotation_font_color=COLORS["accent"],
+        )
+
+
+def _tl_req_vs_avail(d, fleets, funcs, show_actions):
+    fig = go.Figure()
+    for f in fleets:
+        for fn in funcs:
+            col = _fleet_function_color(f, fn)
+            col_light = _fleet_function_color(f, fn, 0.25)
+
+            # Requirement — dashed
+            fig.add_trace(go.Scatter(
+                x=d["labels"], y=d["req"][f][fn],
+                name=f"{f} {fn} — required",
+                mode="lines",
+                line=dict(dash="dash", width=2, color=col),
+                hovertemplate=f"<b>{f} {fn}</b><br>%{{x}}<br>Required: %{{y}}<extra></extra>",
+                legendgroup=f"{f}-{fn}",
+            ))
+            # Availability — solid with soft fill
+            fig.add_trace(go.Scatter(
+                x=d["labels"], y=d["avail"][f][fn],
+                name=f"{f} {fn} — available",
+                mode="lines+markers",
+                line=dict(width=2.5, color=col),
+                marker=dict(size=5, color=col),
+                fill="tozeroy", fillcolor=col_light,
+                hovertemplate=f"<b>{f} {fn}</b><br>%{{x}}<br>Available: %{{y:.1f}}<extra></extra>",
+                legendgroup=f"{f}-{fn}",
+            ))
+
+    if show_actions:
+        _add_action_markers(fig, d, fleets)
+
+    fig.update_layout(
+        height=460, hovermode="x unified",
+        xaxis_title="Month", yaxis_title="Pilots",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35,
+                    xanchor="center", x=0.5, font=dict(size=10)),
+    )
+    fig.update_xaxes(tickangle=-45)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _tl_gap(d, fleets, funcs, show_actions):
+    fig = go.Figure()
+    for f in fleets:
+        for fn in funcs:
+            col = _fleet_function_color(f, fn)
+            fig.add_trace(go.Bar(
+                x=d["labels"], y=d["gaps"][f][fn],
+                name=f"{f} {fn}",
+                marker=dict(color=col, line=dict(width=0)),
+                hovertemplate=f"<b>{f} {fn}</b><br>%{{x}}<br>Gap: %{{y:.1f}}<extra></extra>",
+            ))
+    if show_actions:
+        _add_action_markers(fig, d, fleets)
+    fig.update_layout(
+        height=420, barmode="group", hovermode="x unified",
+        xaxis_title="Month", yaxis_title="Pilot shortfall",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.3,
+                    xanchor="center", x=0.5, font=dict(size=10)),
+    )
+    fig.add_hline(y=1, line_dash="dot", line_color=COLORS["amber"],
+                  annotation_text="Amber threshold",
+                  annotation_position="right",
+                  annotation_font_color=COLORS["amber"])
+    fig.add_hline(y=2, line_dash="dot", line_color=COLORS["red"],
+                  annotation_text="Red threshold",
+                  annotation_position="right",
+                  annotation_font_color=COLORS["red"])
+    fig.update_xaxes(tickangle=-45)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _tl_nationality(d, fleets, funcs):
+    """Stacked bars: Local vs Expat count per fleet/function across months.
+       Note: this is static by month because the registry doesn't project
+       arrivals into nationality buckets beyond month 1 without more modelling.
+       Shown per fleet × function as grouped stacked bars for month 1 onwards
+       using current registry composition, with a note."""
+    ss = st.session_state
+    fig = go.Figure()
+    categories = []
+    local_vals = []
+    expat_vals = []
+    colors_local = []
+    colors_expat = []
+    for f in fleets:
+        for fn in funcs:
+            pilots = [p for p in ss.pilots
+                      if p.fleet == f and p.function == fn and p.status == "Active"]
+            local_vals.append(sum(1 for p in pilots if p.nationality == "Local"))
+            expat_vals.append(sum(1 for p in pilots if p.nationality == "Expat"))
+            categories.append(f"{f}<br>{fn[:3]}")
+            colors_local.append(_fleet_function_color(f, fn, 1.0))
+            colors_expat.append(_fleet_function_color(f, fn, 0.4))
+
+    fig.add_trace(go.Bar(
+        x=categories, y=local_vals, name="Local",
+        marker=dict(color=colors_local),
+        text=local_vals, textposition="inside",
+        hovertemplate="<b>%{x}</b><br>Local: %{y}<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=categories, y=expat_vals, name="Expat",
+        marker=dict(color=colors_expat,
+                    pattern=dict(shape="/", size=6, solidity=0.3)),
+        text=expat_vals, textposition="inside",
+        hovertemplate="<b>%{x}</b><br>Expat: %{y}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        height=420, barmode="stack",
+        xaxis_title="Fleet × Function",
+        yaxis_title="Active pilots",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25,
+                    xanchor="center", x=0.5),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    info_panel(
+        "Nationality view shows current registry composition. "
+        "Future nationality changes from planned hires are reflected in the "
+        "Localisation tab's projection chart."
+    )
+
+
+def _tl_management(d, fleets, funcs):
+    """Show how many pilots are line vs management per fleet/function, and the
+       effective line-ops weight (management counts 0.5)."""
+    ss = st.session_state
+    fig = go.Figure()
+    categories = []
+    line_vals = []
+    mgmt_vals = []
+    effective_vals = []
+    colors_fn = []
+    for f in fleets:
+        for fn in funcs:
+            pilots = [p for p in ss.pilots
+                      if p.fleet == f and p.function == fn and p.status == "Active"]
+            line = sum(1 for p in pilots if not p.management)
+            mgmt = sum(1 for p in pilots if p.management)
+            effective = line + 0.5 * mgmt
+            line_vals.append(line)
+            mgmt_vals.append(mgmt)
+            effective_vals.append(effective)
+            categories.append(f"{f}<br>{fn[:3]}")
+            colors_fn.append(_fleet_function_color(f, fn))
+
+    fig.add_trace(go.Bar(
+        x=categories, y=line_vals, name="Line pilots (1.0)",
+        marker=dict(color=colors_fn),
+        text=line_vals, textposition="inside",
+        hovertemplate="<b>%{x}</b><br>Line: %{y}<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=categories, y=mgmt_vals, name="Management (0.5)",
+        marker=dict(color=colors_fn,
+                    pattern=dict(shape="x", size=6, solidity=0.3)),
+        text=mgmt_vals, textposition="inside",
+        hovertemplate="<b>%{x}</b><br>Management: %{y}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=categories, y=effective_vals, name="Effective weight",
+        mode="markers+text",
+        marker=dict(size=14, color=COLORS["navy"], symbol="diamond"),
+        text=[f"{v:.1f}" for v in effective_vals],
+        textposition="top center",
+        hovertemplate="<b>%{x}</b><br>Effective: %{y:.1f}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        height=460, barmode="stack",
+        xaxis_title="Fleet × Function",
+        yaxis_title="Pilots",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25,
+                    xanchor="center", x=0.5),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -997,26 +1249,71 @@ def _pilot_picker(
     nationality_filter: list[str] | None = None,
     allow_tbd: bool = True,
     max_selections: int | None = None,
+    show_filter_toggle: bool = True,
 ) -> list[str]:
-    """Return a list of pilot employee_ids plus optional TBD placeholder(s)."""
-    ss = st.session_state
-    pool = ss.pilots
-    if fleet_filter:
-        pool = [p for p in pool if p.fleet in fleet_filter]
-    if function_filter:
-        pool = [p for p in pool if p.function in function_filter]
-    if nationality_filter:
-        pool = [p for p in pool if p.nationality in nationality_filter]
+    """
+    Return a list of pilot employee_ids plus optional TBD placeholder(s).
 
-    options_map = {f"{p.employee_id} — {p.full_name} ({p.fleet} {p.function})": p.employee_id
-                   for p in pool}
+    Behaviour:
+      - Shows ALL pilots by default. User can type name or employee_id to search
+        (st.multiselect is natively searchable).
+      - If filter hints are supplied, a 'Show only eligible pilots' toggle is
+        offered so the user can narrow down when they want to, but they retain
+        full control.
+    """
+    ss = st.session_state
+    pool = list(ss.pilots)
+
+    # Optional filter toggle
+    filters_active = bool(fleet_filter or function_filter or nationality_filter)
+    apply_filter = False
+    if filters_active and show_filter_toggle:
+        apply_filter = st.checkbox(
+            "Show only eligible pilots for this action",
+            value=False,
+            key=key + "_filter_toggle",
+            help=(
+                "When ticked, only pilots matching the action's eligibility rules "
+                "are shown. Untick to search the full registry."
+            ),
+        )
+
+    if apply_filter:
+        if fleet_filter:
+            pool = [p for p in pool if p.fleet in fleet_filter]
+        if function_filter:
+            pool = [p for p in pool if p.function in function_filter]
+        if nationality_filter:
+            pool = [p for p in pool if p.nationality in nationality_filter]
+
+    # Sort: active first, then by fleet, function, name
+    status_rank = {"Active": 0, "On Type Rating": 1, "On Leave": 2}
+    pool.sort(key=lambda p: (
+        status_rank.get(p.status, 3),
+        p.fleet, p.function, p.full_name,
+    ))
+
+    # Build readable options — searchable on any substring
+    options_map: dict[str, str] = {}
+    for p in pool:
+        mgmt_tag = " · MGMT" if p.management else ""
+        status_tag = "" if p.status == "Active" else f" · {p.status}"
+        label_str = (
+            f"{p.employee_id}  |  {p.full_name}  |  "
+            f"{p.fleet} {p.function}  |  {p.nationality}{mgmt_tag}{status_tag}"
+        )
+        options_map[label_str] = p.employee_id
+
     if allow_tbd:
-        options_map["TBD-1 (placeholder)"] = "TBD-1"
-        options_map["TBD-2 (placeholder)"] = "TBD-2"
+        options_map["TBD-1  (placeholder — assign name later)"] = "TBD-1"
+        options_map["TBD-2  (placeholder — assign name later)"] = "TBD-2"
 
     selected = st.multiselect(
-        label, options=list(options_map.keys()), key=key,
+        label,
+        options=list(options_map.keys()),
+        key=key,
         max_selections=max_selections,
+        placeholder="Type a name, ID, fleet, or function to search…",
     )
     return [options_map[s] for s in selected]
 
@@ -1575,6 +1872,312 @@ def tab_print_plan():
 
 
 # ---------------------------------------------------------------------------
+# TAB — AI Optimiser (prompt builder)
+# ---------------------------------------------------------------------------
+def tab_ai_optimiser():
+    ss = st.session_state
+    d = derived()
+
+    section_header("AI optimisation prompt builder")
+    info_panel(
+        "This generates a structured prompt you can paste into "
+        " any capable model. The engine will return an optimised plan (type ratings, "
+        "command upgrades, cadet hires, fleet transfers) that you can then enter "
+        "into the Action Planner manually. Nothing is sent anywhere from this app — "
+        "you copy the prompt, use it wherever you like, and bring the plan back.",
+        kind="info",
+    )
+
+    # Objectives and constraints the user can tweak
+    section_header("What should the AI optimise for?")
+    c1, c2 = st.columns(2)
+    with c1:
+        obj_gaps = st.checkbox(
+            "Close all requirement gaps within the horizon",
+            value=True, key="ai_obj_gaps")
+        obj_localise = st.checkbox(
+            "Maximise localisation (replace expats with locals where feasible)",
+            value=True, key="ai_obj_localise")
+        obj_dhc_phase = st.checkbox(
+            "Phase out DHC-8 crew into ATR72 / A320 by end of horizon",
+            value=True, key="ai_obj_dhc")
+    with c2:
+        obj_min_cost = st.checkbox(
+            "Minimise external training (prefer Internal mode when instructors available)",
+            value=True, key="ai_obj_intern")
+        obj_no_conflicts = st.checkbox(
+            "Avoid assigning the same pilot to overlapping actions",
+            value=True, key="ai_obj_conflicts")
+        obj_stagger = st.checkbox(
+            "Stagger trainings so no fleet loses too many pilots simultaneously",
+            value=True, key="ai_obj_stagger")
+
+    max_concurrent = st.slider(
+        "Max concurrent trainings per fleet (hard constraint)",
+        min_value=1, max_value=6, value=2, key="ai_max_concurrent",
+    )
+
+    extra_notes = st.text_area(
+        "Additional instructions for the AI (optional)",
+        placeholder=(
+            "e.g., 'Assume 2 ATR aircraft arrive in months 8 and 14.' "
+            "'Prioritise localising A330 captains first.' "
+            "'No cadet intake in months 1-3 — school intake window starts month 4.'"
+        ),
+        height=100, key="ai_extra_notes",
+    )
+
+    # Build prompt ----------------------------------------------------------
+    section_header("Generated prompt")
+    prompt = _build_optimiser_prompt(
+        state=current_state_payload(),
+        derived=d,
+        objectives={
+            "close_gaps": obj_gaps,
+            "localise": obj_localise,
+            "phase_out_dhc8": obj_dhc_phase,
+            "minimise_external_cost": obj_min_cost,
+            "avoid_conflicts": obj_no_conflicts,
+            "stagger_trainings": obj_stagger,
+            "max_concurrent_per_fleet": max_concurrent,
+        },
+        extra_notes=extra_notes.strip(),
+    )
+
+    st.text_area(
+        "Copy this prompt and paste it into your LLM of choice:",
+        value=prompt, height=480, key="ai_prompt_preview",
+    )
+
+    c1, c2 = st.columns([1, 5])
+    with c1:
+        st.download_button(
+            "⬇ Download .txt",
+            data=prompt,
+            file_name=f"iasl_ai_optimiser_prompt_{date.today().isoformat()}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+    with c2:
+        st.caption(
+            "Tip: Anthropic models handle this prompt best. "
+            "Paste directly — no further formatting needed. "
+            "When the engine returns a plan, enter each action in the Action Planner tab."
+        )
+
+
+def _build_optimiser_prompt(state, derived, objectives, extra_notes) -> str:
+    """Build a complete, self-contained prompt for an external model."""
+    import io as _io
+    labels = derived["labels"]
+    pilots = state["pilots"]
+    actions = state["actions"]
+    fleet_changes = state["fleet_changes"]
+
+    # Helper: human-readable pilot line
+    def pilot_line(p):
+        designations = "|".join(p.designations) if p.designations else "—"
+        mgmt = "MGMT(0.5x)" if p.management else "LINE(1.0x)"
+        return (
+            f"  - {p.employee_id}: {p.full_name} | {p.nationality} | "
+            f"{p.fleet} {p.function} | {p.status} | {mgmt} | designations: {designations}"
+        )
+
+    buf = _io.StringIO()
+
+    # 1. Role and task
+    buf.write(
+        "You are an experienced airline crew planning optimiser. Your task is to "
+        "produce a month-by-month training and hiring plan for Island Aviation "
+        "Services Limited (IASL) that satisfies all operational constraints and "
+        "the stated objectives.\n\n"
+    )
+
+    # 2. Domain rules (so the LLM doesn't invent its own)
+    buf.write("=" * 70 + "\n")
+    buf.write("FIXED OPERATIONAL RULES — DO NOT VIOLATE\n")
+    buf.write("=" * 70 + "\n\n")
+    buf.write(
+        "Crew set ratios (1 crew set = 1 Captain + 1 First Officer):\n"
+        "  A330: 7 crew sets per aircraft\n"
+        "  A320: 5 crew sets per aircraft\n"
+        "  ATR72: 6 crew sets per aircraft\n"
+        "  DHC-8: 5 crew sets per aircraft\n\n"
+        "Management Pilot contribution: 0.5 of a line pilot (regular pilot = 1.0).\n"
+        "A pilot On Type Rating or On Leave contributes 0.0.\n\n"
+        "Training transition durations (months):\n"
+        "  DHC-8 Captain -> ATR Captain: 2\n"
+        "  DHC-8 First Officer -> ATR First Officer: 2\n"
+        "  ATR or DHC-8 (Cpt or FO) -> A320 First Officer: 2\n"
+        "  A320 First Officer -> A330 First Officer: 1\n"
+        "  Same-fleet Command Upgrade (FO -> Captain): 1\n"
+        "  A330 FO -> A320 Captain (compound: type rating + command upgrade): 2\n"
+        "  Cadet hire -> active ATR First Officer: 2 (training lag)\n\n"
+        "Command Upgrade eligibility:\n"
+        "  A330 Captain upgrade: candidates are A330 FOs or A320 Captains.\n"
+        "  A320 Captain upgrade: candidates are A320 FOs or A330 FOs "
+        "(A330 FO path is a 2-month compound action).\n"
+        "  ATR / DHC-8 Captain upgrade: candidates are FOs on the same fleet.\n\n"
+        "Training modes:\n"
+        "  Internal: one destination-fleet Captain acts as instructor AND is "
+        "off line ops for the duration. Up to 2 trainees allowed.\n"
+        "  External: no internal instructor consumed. Up to 2 trainees allowed.\n\n"
+        "Cadet rule: cadets are hired ONLY as ATR First Officers, with a 2-month "
+        "type rating before activation.\n\n"
+        "Gap bands (requirement minus availability):\n"
+        "  gap < 1 month -> green (met)\n"
+        "  1 <= gap < 2 -> amber (1 short)\n"
+        "  gap >= 2 -> red (2+ short)\n\n"
+    )
+
+    # 3. Objectives
+    buf.write("=" * 70 + "\n")
+    buf.write("OBJECTIVES FOR THIS PLAN\n")
+    buf.write("=" * 70 + "\n\n")
+    obj_lines = []
+    if objectives["close_gaps"]:
+        obj_lines.append("- Close all requirement gaps within the planning horizon.")
+    if objectives["localise"]:
+        obj_lines.append(
+            "- Maximise localisation: replace expat pilots with Maldivian locals "
+            "wherever feasible given training routes."
+        )
+    if objectives["phase_out_dhc8"]:
+        obj_lines.append(
+            "- Phase out the DHC-8 fleet. Transition DHC-8 crews to ATR72 "
+            "(same function) or A320 First Officer positions."
+        )
+    if objectives["minimise_external_cost"]:
+        obj_lines.append(
+            "- Minimise External training where Internal is feasible "
+            "(i.e., when a destination-fleet Captain is available as instructor)."
+        )
+    if objectives["avoid_conflicts"]:
+        obj_lines.append(
+            "- No named pilot may be assigned to two overlapping actions."
+        )
+    if objectives["stagger_trainings"]:
+        obj_lines.append(
+            f"- Stagger trainings so no fleet has more than "
+            f"{objectives['max_concurrent_per_fleet']} concurrent trainings at any time."
+        )
+    buf.write("\n".join(obj_lines) + "\n\n")
+
+    # 4. Current state
+    buf.write("=" * 70 + "\n")
+    buf.write("CURRENT STATE\n")
+    buf.write("=" * 70 + "\n\n")
+
+    buf.write(
+        f"Planning period: {labels[0]} to {labels[-1]} "
+        f"({state['horizon']} months)\n\n"
+    )
+
+    buf.write("Initial aircraft count (month 1):\n")
+    for f in FLEETS:
+        buf.write(f"  {f}: {state['initial_aircraft'][f]} aircraft\n")
+    buf.write("\n")
+
+    if fleet_changes:
+        buf.write("Scheduled fleet changes:\n")
+        for c in sorted(fleet_changes, key=lambda x: x.month_index):
+            verb = "ACQUIRE" if c.delta > 0 else "DISPOSE"
+            mo = labels[c.month_index] if 0 <= c.month_index < len(labels) else f"M{c.month_index}"
+            note = f" — {c.note}" if c.note else ""
+            buf.write(f"  {mo}: {verb} 1x {c.fleet}{note}\n")
+        buf.write("\n")
+
+    buf.write("Month-by-month aircraft count:\n")
+    buf.write("  Month          | " + " | ".join(FLEETS) + "\n")
+    for i, lbl in enumerate(labels):
+        row = f"  {lbl:14s} | " + " | ".join(
+            f"{derived['ac_counts'][f][i]:>5d}" for f in FLEETS
+        )
+        buf.write(row + "\n")
+    buf.write("\n")
+
+    # Pilot registry grouped by fleet and function
+    buf.write("PILOT REGISTRY (all pilots):\n\n")
+    for f in FLEETS:
+        for fn in FUNCTIONS:
+            group = [p for p in pilots if p.fleet == f and p.function == fn]
+            if not group:
+                continue
+            locals_n = sum(1 for p in group if p.nationality == "Local")
+            expats_n = sum(1 for p in group if p.nationality == "Expat")
+            mgmt_n = sum(1 for p in group if p.management)
+            buf.write(
+                f"{f} {fn} — {len(group)} pilots "
+                f"({locals_n} Local, {expats_n} Expat, {mgmt_n} Management):\n"
+            )
+            for p in sorted(group, key=lambda x: (x.nationality, x.full_name)):
+                buf.write(pilot_line(p) + "\n")
+            buf.write("\n")
+
+    # 5. Current requirement vs availability
+    buf.write("CURRENT REQUIREMENT vs AVAILABILITY (pre-plan):\n\n")
+    buf.write("  Fleet   Function   " + "  ".join(f"{lbl:>10s}" for lbl in labels) + "\n")
+    for f in FLEETS:
+        for fn in FUNCTIONS:
+            req = derived["req"][f][fn]
+            av = derived["avail"][f][fn]
+            cells = "  ".join(f"{req[i]:>3d}/{av[i]:>5.1f}" for i in range(len(labels)))
+            buf.write(f"  {f:6s}  {fn[:3]:>8s}   {cells}\n")
+    buf.write("\n")
+
+    # 6. Existing planned actions (if any)
+    if actions:
+        buf.write("ALREADY-PLANNED ACTIONS (treat as fixed, build on top of these):\n\n")
+        for a in sorted(actions, key=lambda x: x.start_month):
+            mo = labels[a.start_month] if 0 <= a.start_month < len(labels) else f"M{a.start_month}"
+            buf.write(
+                f"  {mo} | {a.action_type} | "
+                f"from {a.from_fleet} {a.from_function} -> to {a.to_fleet} {a.to_function} | "
+                f"{a.duration}mo | mode={a.mode} | "
+                f"instructor={a.instructor_id or '—'} | "
+                f"trainees={','.join(a.trainee_ids) if a.trainee_ids else '—'} | "
+                f"{a.note}\n"
+            )
+        buf.write("\n")
+
+    # 7. Extra notes
+    if extra_notes:
+        buf.write("=" * 70 + "\n")
+        buf.write("ADDITIONAL INSTRUCTIONS FROM THE PLANNER\n")
+        buf.write("=" * 70 + "\n\n")
+        buf.write(extra_notes + "\n\n")
+
+    # 8. Output format contract
+    buf.write("=" * 70 + "\n")
+    buf.write("REQUIRED OUTPUT FORMAT\n")
+    buf.write("=" * 70 + "\n\n")
+    buf.write(
+        "Return your plan as a numbered list of actions. For EACH action, "
+        "provide the following fields on separate lines, using this exact format:\n\n"
+        "Action N:\n"
+        "  Type: <Type Rating | Command Upgrade | Cadet Hire | Expat Hire | Local Hire>\n"
+        "  Start month: <YYYY-MMM from the planning horizon>\n"
+        "  Duration: <months>\n"
+        "  Mode: <Internal | External | —>\n"
+        "  From: <fleet> <function>        (omit for hires)\n"
+        "  To: <fleet> <function>\n"
+        "  Instructor: <Employee ID or TBD>  (only for Internal mode)\n"
+        "  Trainees: <Employee IDs comma-separated, or TBD-1/TBD-2>\n"
+        "  Rationale: <one-line reason tied to an objective>\n\n"
+        "After the list, provide:\n"
+        "  1. A summary table of monthly requirement-vs-availability after your plan is applied.\n"
+        "  2. A brief risk assessment (what could go wrong, what slack remains).\n"
+        "  3. Any assumptions you had to make.\n\n"
+        "Be concrete. Use actual Employee IDs from the registry above wherever "
+        "possible — only use TBD placeholders when no suitable named pilot exists. "
+        "Respect all fixed operational rules. If an objective conflicts with the "
+        "rules, state the conflict explicitly and pick the rule-compliant option.\n"
+    )
+
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1587,6 +2190,7 @@ def main():
         "📅 Timeline",
         "🎯 Action Planner",
         "🌏 Localisation",
+        "🤖 AI Optimiser",
         "🖨 Print Plan",
     ])
 
@@ -1603,6 +2207,8 @@ def main():
     with tabs[5]:
         tab_localisation()
     with tabs[6]:
+        tab_ai_optimiser()
+    with tabs[7]:
         tab_print_plan()
 
 
