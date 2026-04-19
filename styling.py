@@ -83,6 +83,54 @@ def register_plotly_theme():
 # ---------------------------------------------------------------------------
 _CSS_TEMPLATE = """
 <style>
+/* ---- Force light mode regardless of OS dark-mode preference ---- */
+:root {
+    color-scheme: light only;
+}
+@media (prefers-color-scheme: dark) {
+    .stApp, body, html {
+        background: __BG__ !important;
+        color: __TEXT__ !important;
+        color-scheme: light only !important;
+    }
+    .stApp * {
+        color-scheme: light only;
+    }
+    /* Undo Streamlit's auto-dark adjustments */
+    [data-testid="stAppViewContainer"],
+    [data-testid="stHeader"],
+    [data-testid="stSidebar"],
+    [data-testid="stToolbar"],
+    [data-testid="stMarkdownContainer"] {
+        background-color: transparent !important;
+        color: __TEXT__ !important;
+    }
+    /* Force all form controls to light */
+    input, textarea, select, button {
+        color-scheme: light !important;
+        background-color: __SURFACE__ !important;
+        color: __TEXT__ !important;
+    }
+    /* Dataframe cells */
+    [data-testid="stDataFrame"] * {
+        color: __TEXT__ !important;
+    }
+    [data-testid="stDataFrame"] [role="cell"],
+    [data-testid="stDataFrame"] [role="columnheader"] {
+        background-color: __SURFACE__ !important;
+    }
+    /* Markdown text fallback */
+    .stMarkdown, .stMarkdown p, .stMarkdown li, .stMarkdown span,
+    .stMarkdown div, .stCaption, label {
+        color: __TEXT__ !important;
+    }
+    /* Expander content */
+    details, summary, [data-testid="stExpander"] {
+        background-color: __SURFACE__ !important;
+        color: __TEXT__ !important;
+    }
+}
+
 .stApp {
     background: __BG__;
     color: __TEXT__;
