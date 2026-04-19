@@ -544,31 +544,187 @@ def tab_registry():
                 file_name="iasl_pilots.csv",
                 mime="text/csv",
             )
-        st.markdown("**Import** pilots from CSV (same column schema as export):")
-        up = st.file_uploader("Upload CSV", type=["csv"], key="csv_up")
+
+        st.markdown("---")
+        st.markdown("**Import** pilots from CSV")
+        st.caption(
+            "Required columns: employee_id, full_name, nationality, fleet, function. "
+            "Optional: designations (pipe-separated, e.g. TRE|LI), management (true/false), status. "
+            "Values must match: nationality ∈ {Local, Expat}; fleet ∈ {A330, A320, ATR72, DHC8}; "
+            "function ∈ {Captain, First Officer}; status ∈ {Active, On Type Rating, On Leave}."
+        )
+
+        # Template download
+        template_df = pd.DataFrame([
+            {"employee_id": "P001", "full_name": "Example Captain",
+             "nationality": "Local", "fleet": "ATR72", "function": "Captain",
+             "designations": "TRE|LI", "management": False, "status": "Active"},
+            {"employee_id": "P002", "full_name": "Example First Officer",
+             "nationality": "Expat", "fleet": "A320", "function": "First Officer",
+             "designations": "", "management": False, "status": "Active"},
+        ])
+        st.download_button(
+            "📄 Download CSV template",
+            data=template_df.to_csv(index=False),
+            file_name="iasl_pilots_template.csv",
+            mime="text/csv",
+        )
+
+        # Import options
+        replace_mode = st.checkbox(
+            "Replace existing registry (delete all current pilots first)",
+            value=False, key="csv_replace_mode",
+        )
+
+        up = st.file_uploader(
+            "Upload CSV",
+            type=["csv"],
+            key=f"csv_up_{st.session_state.get('csv_upload_counter', 0)}",
+        )
+
         if up is not None:
             try:
-                df = pd.read_csv(up)
-                added = 0
-                for _, r in df.iterrows():
-                    eid = str(r.get("employee_id", "")).strip()
-                    if not eid or any(p.employee_id == eid for p in ss.pilots):
-                        continue
-                    ss.pilots.append(Pilot(
-                        employee_id=eid,
-                        full_name=str(r["full_name"]),
-                        nationality=str(r["nationality"]),
-                        fleet=str(r["fleet"]),
-                        function=str(r["function"]),
-                        designations=[d for d in str(r.get("designations", "")).split("|") if d],
-                        management=bool(r.get("management", False)),
-                        status=str(r.get("status", "Active")),
-                    ))
-                    added += 1
-                st.success(f"Imported {added} pilots.")
-                st.rerun()
+                # Parse
+                df = pd.read_csv(up, dtype=str, keep_default_na=False)
+                df.columns = [c.strip().lower() for c in df.columns]
+
+                # Validate required columns
+                required = {"employee_id", "full_name", "nationality",
+                            "fleet", "function"}
+                missing = required - set(df.columns)
+                if missing:
+                    st.error(f"CSV is missing required columns: {', '.join(sorted(missing))}")
+                else:
+                    # Validation pass
+                    valid_fleets = set(FLEETS)
+                    valid_functions = set(FUNCTIONS)
+                    valid_nationalities = set(NATIONALITIES)
+                    valid_statuses = set(PILOT_STATUSES)
+
+                    errors = []
+                    new_pilots = []
+
+                    for idx, r in df.iterrows():
+                        row_num = idx + 2  # account for header row
+                        eid = str(r["employee_id"]).strip()
+                        name = str(r["full_name"]).strip()
+                        nat = str(r["nationality"]).strip()
+                        fleet = str(r["fleet"]).strip()
+                        func = str(r["function"]).strip()
+
+                        if not eid:
+                            errors.append(f"Row {row_num}: empty employee_id")
+                            continue
+                        if not name:
+                            errors.append(f"Row {row_num}: empty full_name")
+                            continue
+                        if nat not in valid_nationalities:
+                            errors.append(
+                                f"Row {row_num}: nationality '{nat}' invalid "
+                                f"(must be Local or Expat)"
+                            )
+                            continue
+                        if fleet not in valid_fleets:
+                            errors.append(
+                                f"Row {row_num}: fleet '{fleet}' invalid "
+                                f"(must be one of {', '.join(sorted(valid_fleets))})"
+                            )
+                            continue
+                        if func not in valid_functions:
+                            errors.append(
+                                f"Row {row_num}: function '{func}' invalid "
+                                f"(must be Captain or First Officer)"
+                            )
+                            continue
+
+                        # Optional columns
+                        desig_raw = str(r.get("designations", "")).strip()
+                        desigs = [d.strip() for d in desig_raw.split("|") if d.strip()]
+
+                        mgmt_raw = str(r.get("management", "")).strip().lower()
+                        mgmt = mgmt_raw in ("true", "1", "yes", "y", "t")
+
+                        status = str(r.get("status", "Active")).strip() or "Active"
+                        if status not in valid_statuses:
+                            errors.append(
+                                f"Row {row_num}: status '{status}' invalid "
+                                f"(must be one of {', '.join(sorted(valid_statuses))})"
+                            )
+                            continue
+
+                        new_pilots.append(Pilot(
+                            employee_id=eid,
+                            full_name=name,
+                            nationality=nat,
+                            fleet=fleet,
+                            function=func,
+                            designations=desigs,
+                            management=mgmt,
+                            status=status,
+                        ))
+
+                    # Preview
+                    st.markdown(f"**Parsed {len(new_pilots)} valid row(s) "
+                                f"from {len(df)} total.**")
+
+                    if errors:
+                        with st.expander(f"⚠ {len(errors)} row(s) had errors (click to view)"):
+                            for e in errors[:50]:
+                                st.markdown(f"- {e}")
+                            if len(errors) > 50:
+                                st.markdown(f"…and {len(errors) - 50} more.")
+
+                    if new_pilots:
+                        preview_df = pd.DataFrame([{
+                            "ID": p.employee_id,
+                            "Name": p.full_name,
+                            "Fleet": p.fleet,
+                            "Function": p.function,
+                            "Nationality": p.nationality,
+                            "Mgmt": "Yes" if p.management else "No",
+                            "Status": p.status,
+                        } for p in new_pilots[:20]])
+                        st.markdown("**Preview (first 20 rows):**")
+                        st.dataframe(preview_df, use_container_width=True,
+                                     hide_index=True)
+
+                        # Commit button
+                        if st.button(
+                            f"✓ Confirm import of {len(new_pilots)} pilot(s)",
+                            type="primary",
+                            key="csv_commit",
+                        ):
+                            if replace_mode:
+                                ss.pilots = []
+                            # Deduplicate by employee_id
+                            existing_ids = {p.employee_id for p in ss.pilots}
+                            added = 0
+                            skipped = 0
+                            for p in new_pilots:
+                                if p.employee_id in existing_ids:
+                                    skipped += 1
+                                    continue
+                                ss.pilots.append(p)
+                                existing_ids.add(p.employee_id)
+                                added += 1
+
+                            msg = f"Imported {added} pilot(s)."
+                            if skipped > 0:
+                                msg += f" Skipped {skipped} duplicate ID(s)."
+                            st.success(msg)
+
+                            # Bump the uploader key so the widget resets
+                            st.session_state["csv_upload_counter"] = (
+                                st.session_state.get("csv_upload_counter", 0) + 1
+                            )
+                            st.rerun()
+
+            except pd.errors.EmptyDataError:
+                st.error("The uploaded file is empty.")
+            except pd.errors.ParserError as e:
+                st.error(f"Could not parse CSV: {e}")
             except Exception as e:
-                st.error(f"Import failed: {e}")
+                st.error(f"Import failed: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------------------
