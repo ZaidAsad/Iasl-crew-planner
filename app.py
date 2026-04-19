@@ -1185,7 +1185,7 @@ def _render_cascade_plot(graph, key_suffix: str = ""):
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="markers+text",
             marker=dict(size=36, color=kind_color[kind],
-                        line=dict(color=COLORS["bg"], width=2)),
+                        line=dict(color="white", width=2)),
             text=texts, textposition="middle right",
             textfont=dict(size=11, color=COLORS["text"]),
             name=kind.capitalize(),
