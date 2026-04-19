@@ -2068,7 +2068,7 @@ def main():
         "📅 Timeline",
         "🎯 Action Planner",
         "🌏 Localisation",
-        "🤖 Optimiser",
+        "🤖 AI Optimiser",
         "🖨 Print Plan",
     ])
 
