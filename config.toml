@@ -3,8 +3,9 @@ headless = true
 enableCORS = false
 
 [theme]
-base = "dark"
-backgroundColor = "#0B1220"
-secondaryBackgroundColor = "#111A2E"
-textColor = "#E6ECF5"
+base = "light"
+primaryColor = "#00857A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F7FA"
+textColor = "#1F2937"
 font = "sans serif"
