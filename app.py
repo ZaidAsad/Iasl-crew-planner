@@ -11,7 +11,7 @@ Structure:
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from io import StringIO
 
 import pandas as pd
@@ -1880,45 +1880,74 @@ def tab_ai_optimiser():
 
     section_header("AI optimisation prompt builder")
     info_panel(
-        "This generates a structured prompt you can paste into "
-        " any capable model. The engine will return an optimised plan (type ratings, "
+        "This generates a structured prompt you can paste into engine, "
+        "or any capable model. The engine will return an optimised plan (type ratings, "
         "command upgrades, cadet hires, fleet transfers) that you can then enter "
         "into the Action Planner manually. Nothing is sent anywhere from this app — "
         "you copy the prompt, use it wherever you like, and bring the plan back.",
         kind="info",
     )
 
-    # Objectives and constraints the user can tweak
+    # ---- Data fingerprint (detects when registry / actions / fleet changed) ----
+    fingerprint = _state_fingerprint()
+    last_built_fp = ss.get("ai_prompt_fingerprint")
+    last_built_at = ss.get("ai_prompt_built_at")
+    is_stale = (last_built_fp is not None and last_built_fp != fingerprint)
+
+    # Show freshness banner
+    if last_built_at is None:
+        info_panel(
+            "No prompt generated yet. Configure objectives below and click "
+            "<b>Build prompt</b>.", kind="info",
+        )
+    elif is_stale:
+        info_panel(
+            f"⚠ <b>Prompt is out of date.</b> The registry, actions, or fleet "
+            f"plan has changed since this prompt was last built "
+            f"({last_built_at}). Click <b>Rebuild prompt</b> to refresh it with "
+            f"current data.",
+            kind="warn",
+        )
+    else:
+        info_panel(
+            f"✓ Prompt reflects current state (built {last_built_at}).",
+            kind="info",
+        )
+
+    # ---- Objectives ----
     section_header("What should the AI optimise for?")
     c1, c2 = st.columns(2)
     with c1:
         obj_gaps = st.checkbox(
             "Close all requirement gaps within the horizon",
-            value=True, key="ai_obj_gaps")
+            value=ss.get("ai_obj_gaps", True), key="ai_obj_gaps")
         obj_localise = st.checkbox(
             "Maximise localisation (replace expats with locals where feasible)",
-            value=True, key="ai_obj_localise")
+            value=ss.get("ai_obj_localise", True), key="ai_obj_localise")
         obj_dhc_phase = st.checkbox(
             "Phase out DHC-8 crew into ATR72 / A320 by end of horizon",
-            value=True, key="ai_obj_dhc")
+            value=ss.get("ai_obj_dhc", True), key="ai_obj_dhc")
     with c2:
         obj_min_cost = st.checkbox(
             "Minimise external training (prefer Internal mode when instructors available)",
-            value=True, key="ai_obj_intern")
+            value=ss.get("ai_obj_intern", True), key="ai_obj_intern")
         obj_no_conflicts = st.checkbox(
             "Avoid assigning the same pilot to overlapping actions",
-            value=True, key="ai_obj_conflicts")
+            value=ss.get("ai_obj_conflicts", True), key="ai_obj_conflicts")
         obj_stagger = st.checkbox(
             "Stagger trainings so no fleet loses too many pilots simultaneously",
-            value=True, key="ai_obj_stagger")
+            value=ss.get("ai_obj_stagger", True), key="ai_obj_stagger")
 
     max_concurrent = st.slider(
         "Max concurrent trainings per fleet (hard constraint)",
-        min_value=1, max_value=6, value=2, key="ai_max_concurrent",
+        min_value=1, max_value=6,
+        value=ss.get("ai_max_concurrent", 2),
+        key="ai_max_concurrent",
     )
 
     extra_notes = st.text_area(
         "Additional instructions for the AI (optional)",
+        value=ss.get("ai_extra_notes_val", ""),
         placeholder=(
             "e.g., 'Assume 2 ATR aircraft arrive in months 8 and 14.' "
             "'Prioritise localising A330 captains first.' "
@@ -1927,254 +1956,103 @@ def tab_ai_optimiser():
         height=100, key="ai_extra_notes",
     )
 
-    # Build prompt ----------------------------------------------------------
-    section_header("Generated prompt")
-    prompt = _build_optimiser_prompt(
-        state=current_state_payload(),
-        derived=d,
-        objectives={
-            "close_gaps": obj_gaps,
-            "localise": obj_localise,
-            "phase_out_dhc8": obj_dhc_phase,
-            "minimise_external_cost": obj_min_cost,
-            "avoid_conflicts": obj_no_conflicts,
-            "stagger_trainings": obj_stagger,
-            "max_concurrent_per_fleet": max_concurrent,
-        },
-        extra_notes=extra_notes.strip(),
-    )
+    # ---- Build / rebuild controls ----
+    section_header("Build prompt")
 
-    st.text_area(
-        "Copy this prompt and paste it into your LLM of choice:",
-        value=prompt, height=480, key="ai_prompt_preview",
-    )
-
-    c1, c2 = st.columns([1, 5])
-    with c1:
-        st.download_button(
-            "⬇ Download .txt",
-            data=prompt,
-            file_name=f"iasl_ai_optimiser_prompt_{date.today().isoformat()}.txt",
-            mime="text/plain",
-            use_container_width=True,
+    btn_col1, btn_col2, btn_col3 = st.columns([1.5, 1.5, 4])
+    with btn_col1:
+        build_label = "🔄 Rebuild prompt" if ss.get("ai_prompt_text") else "🛠 Build prompt"
+        build_clicked = st.button(
+            build_label, type="primary", use_container_width=True,
         )
-    with c2:
+    with btn_col2:
+        if st.button("🗑 Clear prompt", use_container_width=True):
+            ss.pop("ai_prompt_text", None)
+            ss.pop("ai_prompt_fingerprint", None)
+            ss.pop("ai_prompt_built_at", None)
+            st.rerun()
+    with btn_col3:
         st.caption(
-            "Tip: Anthropic models handle this prompt best. "
-            "Paste directly — no further formatting needed. "
-            "When the engine returns a plan, enter each action in the Action Planner tab."
+            "Click to generate a fresh prompt from the current registry, "
+            "fleet plan, and scheduled actions. Rebuild whenever any of these change."
         )
 
-
-def _build_optimiser_prompt(state, derived, objectives, extra_notes) -> str:
-    """Build a complete, self-contained prompt for an external model."""
-    import io as _io
-    labels = derived["labels"]
-    pilots = state["pilots"]
-    actions = state["actions"]
-    fleet_changes = state["fleet_changes"]
-
-    # Helper: human-readable pilot line
-    def pilot_line(p):
-        designations = "|".join(p.designations) if p.designations else "—"
-        mgmt = "MGMT(0.5x)" if p.management else "LINE(1.0x)"
-        return (
-            f"  - {p.employee_id}: {p.full_name} | {p.nationality} | "
-            f"{p.fleet} {p.function} | {p.status} | {mgmt} | designations: {designations}"
+    # Build on click
+    if build_clicked:
+        prompt = _build_optimiser_prompt(
+            state=current_state_payload(),
+            derived=d,
+            objectives={
+                "close_gaps": obj_gaps,
+                "localise": obj_localise,
+                "phase_out_dhc8": obj_dhc_phase,
+                "minimise_external_cost": obj_min_cost,
+                "avoid_conflicts": obj_no_conflicts,
+                "stagger_trainings": obj_stagger,
+                "max_concurrent_per_fleet": max_concurrent,
+            },
+            extra_notes=extra_notes.strip(),
         )
+        ss["ai_prompt_text"] = prompt
+        ss["ai_prompt_fingerprint"] = fingerprint
+        ss["ai_prompt_built_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ss["ai_extra_notes_val"] = extra_notes
+        st.rerun()
 
-    buf = _io.StringIO()
-
-    # 1. Role and task
-    buf.write(
-        "You are an experienced airline crew planning optimiser. Your task is to "
-        "produce a month-by-month training and hiring plan for Island Aviation "
-        "Services Limited (IASL) that satisfies all operational constraints and "
-        "the stated objectives.\n\n"
-    )
-
-    # 2. Domain rules (so the LLM doesn't invent its own)
-    buf.write("=" * 70 + "\n")
-    buf.write("FIXED OPERATIONAL RULES — DO NOT VIOLATE\n")
-    buf.write("=" * 70 + "\n\n")
-    buf.write(
-        "Crew set ratios (1 crew set = 1 Captain + 1 First Officer):\n"
-        "  A330: 7 crew sets per aircraft\n"
-        "  A320: 5 crew sets per aircraft\n"
-        "  ATR72: 6 crew sets per aircraft\n"
-        "  DHC-8: 5 crew sets per aircraft\n\n"
-        "Management Pilot contribution: 0.5 of a line pilot (regular pilot = 1.0).\n"
-        "A pilot On Type Rating or On Leave contributes 0.0.\n\n"
-        "Training transition durations (months):\n"
-        "  DHC-8 Captain -> ATR Captain: 2\n"
-        "  DHC-8 First Officer -> ATR First Officer: 2\n"
-        "  ATR or DHC-8 (Cpt or FO) -> A320 First Officer: 2\n"
-        "  A320 First Officer -> A330 First Officer: 1\n"
-        "  Same-fleet Command Upgrade (FO -> Captain): 1\n"
-        "  A330 FO -> A320 Captain (compound: type rating + command upgrade): 2\n"
-        "  Cadet hire -> active ATR First Officer: 2 (training lag)\n\n"
-        "Command Upgrade eligibility:\n"
-        "  A330 Captain upgrade: candidates are A330 FOs or A320 Captains.\n"
-        "  A320 Captain upgrade: candidates are A320 FOs or A330 FOs "
-        "(A330 FO path is a 2-month compound action).\n"
-        "  ATR / DHC-8 Captain upgrade: candidates are FOs on the same fleet.\n\n"
-        "Training modes:\n"
-        "  Internal: one destination-fleet Captain acts as instructor AND is "
-        "off line ops for the duration. Up to 2 trainees allowed.\n"
-        "  External: no internal instructor consumed. Up to 2 trainees allowed.\n\n"
-        "Cadet rule: cadets are hired ONLY as ATR First Officers, with a 2-month "
-        "type rating before activation.\n\n"
-        "Gap bands (requirement minus availability):\n"
-        "  gap < 1 month -> green (met)\n"
-        "  1 <= gap < 2 -> amber (1 short)\n"
-        "  gap >= 2 -> red (2+ short)\n\n"
-    )
-
-    # 3. Objectives
-    buf.write("=" * 70 + "\n")
-    buf.write("OBJECTIVES FOR THIS PLAN\n")
-    buf.write("=" * 70 + "\n\n")
-    obj_lines = []
-    if objectives["close_gaps"]:
-        obj_lines.append("- Close all requirement gaps within the planning horizon.")
-    if objectives["localise"]:
-        obj_lines.append(
-            "- Maximise localisation: replace expat pilots with Maldivian locals "
-            "wherever feasible given training routes."
+    # ---- Prompt preview + download ----
+    if ss.get("ai_prompt_text"):
+        section_header("Generated prompt")
+        st.caption(
+            f"Built at {ss['ai_prompt_built_at']}  ·  "
+            f"{len(ss['ai_prompt_text']):,} characters  ·  "
+            f"≈ {len(ss['ai_prompt_text']) // 4:,} tokens"
         )
-    if objectives["phase_out_dhc8"]:
-        obj_lines.append(
-            "- Phase out the DHC-8 fleet. Transition DHC-8 crews to ATR72 "
-            "(same function) or A320 First Officer positions."
+        # Use a unique key tied to the fingerprint so the text area refreshes
+        # cleanly when the prompt is rebuilt.
+        st.text_area(
+            "Copy this prompt and paste it into your LLM of choice:",
+            value=ss["ai_prompt_text"],
+            height=480,
+            key=f"ai_prompt_preview_{ss['ai_prompt_fingerprint']}",
         )
-    if objectives["minimise_external_cost"]:
-        obj_lines.append(
-            "- Minimise External training where Internal is feasible "
-            "(i.e., when a destination-fleet Captain is available as instructor)."
-        )
-    if objectives["avoid_conflicts"]:
-        obj_lines.append(
-            "- No named pilot may be assigned to two overlapping actions."
-        )
-    if objectives["stagger_trainings"]:
-        obj_lines.append(
-            f"- Stagger trainings so no fleet has more than "
-            f"{objectives['max_concurrent_per_fleet']} concurrent trainings at any time."
-        )
-    buf.write("\n".join(obj_lines) + "\n\n")
-
-    # 4. Current state
-    buf.write("=" * 70 + "\n")
-    buf.write("CURRENT STATE\n")
-    buf.write("=" * 70 + "\n\n")
-
-    buf.write(
-        f"Planning period: {labels[0]} to {labels[-1]} "
-        f"({state['horizon']} months)\n\n"
-    )
-
-    buf.write("Initial aircraft count (month 1):\n")
-    for f in FLEETS:
-        buf.write(f"  {f}: {state['initial_aircraft'][f]} aircraft\n")
-    buf.write("\n")
-
-    if fleet_changes:
-        buf.write("Scheduled fleet changes:\n")
-        for c in sorted(fleet_changes, key=lambda x: x.month_index):
-            verb = "ACQUIRE" if c.delta > 0 else "DISPOSE"
-            mo = labels[c.month_index] if 0 <= c.month_index < len(labels) else f"M{c.month_index}"
-            note = f" — {c.note}" if c.note else ""
-            buf.write(f"  {mo}: {verb} 1x {c.fleet}{note}\n")
-        buf.write("\n")
-
-    buf.write("Month-by-month aircraft count:\n")
-    buf.write("  Month          | " + " | ".join(FLEETS) + "\n")
-    for i, lbl in enumerate(labels):
-        row = f"  {lbl:14s} | " + " | ".join(
-            f"{derived['ac_counts'][f][i]:>5d}" for f in FLEETS
-        )
-        buf.write(row + "\n")
-    buf.write("\n")
-
-    # Pilot registry grouped by fleet and function
-    buf.write("PILOT REGISTRY (all pilots):\n\n")
-    for f in FLEETS:
-        for fn in FUNCTIONS:
-            group = [p for p in pilots if p.fleet == f and p.function == fn]
-            if not group:
-                continue
-            locals_n = sum(1 for p in group if p.nationality == "Local")
-            expats_n = sum(1 for p in group if p.nationality == "Expat")
-            mgmt_n = sum(1 for p in group if p.management)
-            buf.write(
-                f"{f} {fn} — {len(group)} pilots "
-                f"({locals_n} Local, {expats_n} Expat, {mgmt_n} Management):\n"
+        c1, c2 = st.columns([1, 5])
+        with c1:
+            st.download_button(
+                "⬇ Download .txt",
+                data=ss["ai_prompt_text"],
+                file_name=f"iasl_ai_optimiser_prompt_{date.today().isoformat()}.txt",
+                mime="text/plain",
+                use_container_width=True,
             )
-            for p in sorted(group, key=lambda x: (x.nationality, x.full_name)):
-                buf.write(pilot_line(p) + "\n")
-            buf.write("\n")
-
-    # 5. Current requirement vs availability
-    buf.write("CURRENT REQUIREMENT vs AVAILABILITY (pre-plan):\n\n")
-    buf.write("  Fleet   Function   " + "  ".join(f"{lbl:>10s}" for lbl in labels) + "\n")
-    for f in FLEETS:
-        for fn in FUNCTIONS:
-            req = derived["req"][f][fn]
-            av = derived["avail"][f][fn]
-            cells = "  ".join(f"{req[i]:>3d}/{av[i]:>5.1f}" for i in range(len(labels)))
-            buf.write(f"  {f:6s}  {fn[:3]:>8s}   {cells}\n")
-    buf.write("\n")
-
-    # 6. Existing planned actions (if any)
-    if actions:
-        buf.write("ALREADY-PLANNED ACTIONS (treat as fixed, build on top of these):\n\n")
-        for a in sorted(actions, key=lambda x: x.start_month):
-            mo = labels[a.start_month] if 0 <= a.start_month < len(labels) else f"M{a.start_month}"
-            buf.write(
-                f"  {mo} | {a.action_type} | "
-                f"from {a.from_fleet} {a.from_function} -> to {a.to_fleet} {a.to_function} | "
-                f"{a.duration}mo | mode={a.mode} | "
-                f"instructor={a.instructor_id or '—'} | "
-                f"trainees={','.join(a.trainee_ids) if a.trainee_ids else '—'} | "
-                f"{a.note}\n"
+        with c2:
+            st.caption(
+                "Tip: Anthorpic models handle this prompt best. "
+                "Paste directly — no further formatting needed. "
+                "When the engine returns a plan, enter each action in the Action Planner tab."
             )
-        buf.write("\n")
 
-    # 7. Extra notes
-    if extra_notes:
-        buf.write("=" * 70 + "\n")
-        buf.write("ADDITIONAL INSTRUCTIONS FROM THE PLANNER\n")
-        buf.write("=" * 70 + "\n\n")
-        buf.write(extra_notes + "\n\n")
 
-    # 8. Output format contract
-    buf.write("=" * 70 + "\n")
-    buf.write("REQUIRED OUTPUT FORMAT\n")
-    buf.write("=" * 70 + "\n\n")
-    buf.write(
-        "Return your plan as a numbered list of actions. For EACH action, "
-        "provide the following fields on separate lines, using this exact format:\n\n"
-        "Action N:\n"
-        "  Type: <Type Rating | Command Upgrade | Cadet Hire | Expat Hire | Local Hire>\n"
-        "  Start month: <YYYY-MMM from the planning horizon>\n"
-        "  Duration: <months>\n"
-        "  Mode: <Internal | External | —>\n"
-        "  From: <fleet> <function>        (omit for hires)\n"
-        "  To: <fleet> <function>\n"
-        "  Instructor: <Employee ID or TBD>  (only for Internal mode)\n"
-        "  Trainees: <Employee IDs comma-separated, or TBD-1/TBD-2>\n"
-        "  Rationale: <one-line reason tied to an objective>\n\n"
-        "After the list, provide:\n"
-        "  1. A summary table of monthly requirement-vs-availability after your plan is applied.\n"
-        "  2. A brief risk assessment (what could go wrong, what slack remains).\n"
-        "  3. Any assumptions you had to make.\n\n"
-        "Be concrete. Use actual Employee IDs from the registry above wherever "
-        "possible — only use TBD placeholders when no suitable named pilot exists. "
-        "Respect all fixed operational rules. If an objective conflicts with the "
-        "rules, state the conflict explicitly and pick the rule-compliant option.\n"
-    )
+def _state_fingerprint() -> str:
+    """
+    Produce a short hash of everything the optimiser prompt depends on.
+    When this fingerprint changes, the prompt is stale and needs rebuilding.
+    """
+    import hashlib
+    import json as _json
+    from dataclasses import asdict as _asdict
 
-    return buf.getvalue()
+    ss = st.session_state
+    payload = {
+        "start_year": ss.get("start_year"),
+        "start_month": ss.get("start_month"),
+        "horizon": ss.get("horizon"),
+        "initial_aircraft": ss.get("initial_aircraft", {}),
+        "pilots": [_asdict(p) for p in ss.get("pilots", [])],
+        "fleet_changes": [_asdict(c) for c in ss.get("fleet_changes", [])],
+        "actions": [_asdict(a) for a in ss.get("actions", [])],
+    }
+    blob = _json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -2190,7 +2068,7 @@ def main():
         "📅 Timeline",
         "🎯 Action Planner",
         "🌏 Localisation",
-        "🤖 AI Optimiser",
+        "🤖 Optimiser",
         "🖨 Print Plan",
     ])
 
