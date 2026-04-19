@@ -1,6 +1,7 @@
 """
 IASL Crew Planning Portal — styling module.
 Central home for CSS, Plotly theme, colour tokens, and small UI helpers.
+Light theme, IASL-appropriate.
 """
 
 import streamlit as st
@@ -8,34 +9,34 @@ import plotly.graph_objects as go
 import plotly.io as pio
 
 # ---------------------------------------------------------------------------
-# Colour tokens
+# Colour tokens — light theme
 # ---------------------------------------------------------------------------
 COLORS = {
-    "bg":           "#0B1220",   # app background
-    "surface":      "#111A2E",   # card background
-    "surface_alt":  "#18243D",   # raised card / hover
-    "border":       "#22304A",
-    "text":         "#E6ECF5",
-    "text_muted":   "#8FA0BD",
-    "accent":       "#00B3A6",   # IASL-style teal
-    "accent_soft":  "#0E3A38",
-    "green":        "#22C55E",
-    "amber":        "#F59E0B",
-    "red":          "#EF4444",
-    "blue":         "#3B82F6",
-    "violet":       "#8B5CF6",
+    "bg":           "#F7F9FC",   # app background (subtle cool grey)
+    "surface":      "#FFFFFF",   # card background
+    "surface_alt":  "#F0F4F9",   # raised card / hover
+    "border":       "#E2E8F0",
+    "text":         "#1F2937",
+    "text_muted":   "#6B7A8F",
+    "accent":       "#00857A",   # IASL teal (deeper for light bg)
+    "accent_soft":  "#E0F2F0",
+    "navy":         "#0F2944",   # used for dark text/accents
+    "green":        "#16A34A",
+    "amber":        "#D97706",
+    "red":          "#DC2626",
+    "blue":         "#2563EB",
+    "violet":       "#7C3AED",
 }
 
 FLEET_COLORS = {
-    "A330":   "#8B5CF6",
-    "A320":   "#3B82F6",
-    "ATR72":  "#00B3A6",
-    "DHC8":   "#F59E0B",
+    "A330":   "#7C3AED",
+    "A320":   "#2563EB",
+    "ATR72":  "#00857A",
+    "DHC8":   "#D97706",
 }
 
 
 def status_color(gap: float) -> str:
-    """Return the status colour for a given numeric gap (requirement - availability)."""
     if gap < 1:
         return COLORS["green"]
     if gap < 2:
@@ -52,7 +53,7 @@ def status_label(gap: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Plotly default template
+# Plotly default template — light
 # ---------------------------------------------------------------------------
 def register_plotly_theme():
     tpl = go.layout.Template()
@@ -67,9 +68,9 @@ def register_plotly_theme():
                    linecolor=COLORS["border"], tickcolor=COLORS["border"]),
         yaxis=dict(gridcolor=COLORS["border"], zerolinecolor=COLORS["border"],
                    linecolor=COLORS["border"], tickcolor=COLORS["border"]),
-        legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor=COLORS["border"]),
+        legend=dict(bgcolor="rgba(255,255,255,0.85)", bordercolor=COLORS["border"]),
         margin=dict(l=50, r=30, t=50, b=40),
-        hoverlabel=dict(bgcolor=COLORS["surface_alt"],
+        hoverlabel=dict(bgcolor=COLORS["surface"],
                         bordercolor=COLORS["border"],
                         font=dict(color=COLORS["text"])),
     )
@@ -78,14 +79,14 @@ def register_plotly_theme():
 
 
 # ---------------------------------------------------------------------------
-# Global CSS
+# Global CSS — light theme
 # ---------------------------------------------------------------------------
 def inject_css():
     css = f"""
     <style>
     /* ---- Base ---- */
     .stApp {{
-        background: linear-gradient(180deg, {COLORS['bg']} 0%, #0A0F1C 100%);
+        background: {COLORS['bg']};
         color: {COLORS['text']};
     }}
     html, body, [class*="css"] {{
@@ -99,7 +100,7 @@ def inject_css():
 
     /* ---- Headings ---- */
     h1, h2, h3, h4 {{
-        color: {COLORS['text']};
+        color: {COLORS['navy']};
         font-weight: 600;
         letter-spacing: -0.01em;
     }}
@@ -117,21 +118,21 @@ def inject_css():
         border: 1px solid {COLORS['border']};
         border-radius: 14px;
         margin-bottom: 18px;
-        box-shadow: 0 4px 18px rgba(0,0,0,0.25);
+        box-shadow: 0 2px 10px rgba(15,41,68,0.06);
     }}
     .iasl-brand {{
         display: flex; align-items: center; gap: 14px;
     }}
     .iasl-logo {{
         width: 42px; height: 42px; border-radius: 10px;
-        background: linear-gradient(135deg, {COLORS['accent']} 0%, #0077B6 100%);
+        background: linear-gradient(135deg, {COLORS['accent']} 0%, #0F5E9C 100%);
         display: flex; align-items: center; justify-content: center;
         color: white; font-weight: 800; font-size: 16px;
         letter-spacing: 0.5px;
-        box-shadow: 0 4px 12px rgba(0,179,166,0.3);
+        box-shadow: 0 4px 12px rgba(0,133,122,0.25);
     }}
     .iasl-title {{
-        font-size: 17px; font-weight: 700; color: {COLORS['text']};
+        font-size: 17px; font-weight: 700; color: {COLORS['navy']};
         line-height: 1.1;
     }}
     .iasl-subtitle {{
@@ -149,7 +150,7 @@ def inject_css():
         text-transform: uppercase; letter-spacing: 1px;
     }}
     .iasl-nav-stat-value {{
-        font-size: 18px; font-weight: 700; color: {COLORS['text']};
+        font-size: 18px; font-weight: 700; color: {COLORS['navy']};
     }}
 
     /* ---- Metric cards ---- */
@@ -158,18 +159,20 @@ def inject_css():
         border: 1px solid {COLORS['border']};
         border-radius: 14px;
         padding: 18px 20px;
-        transition: transform 0.15s ease, border-color 0.15s ease;
+        transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+        box-shadow: 0 1px 3px rgba(15,41,68,0.04);
     }}
     .metric-card:hover {{
         transform: translateY(-2px);
         border-color: {COLORS['accent']};
+        box-shadow: 0 4px 12px rgba(0,133,122,0.1);
     }}
     .metric-label {{
         font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px;
         color: {COLORS['text_muted']}; margin-bottom: 6px;
     }}
     .metric-value {{
-        font-size: 30px; font-weight: 700; color: {COLORS['text']};
+        font-size: 30px; font-weight: 700; color: {COLORS['navy']};
         line-height: 1.1;
     }}
     .metric-delta {{
@@ -183,12 +186,14 @@ def inject_css():
         border-radius: 14px;
         padding: 16px 18px;
         border-left: 4px solid {COLORS['accent']};
+        box-shadow: 0 1px 3px rgba(15,41,68,0.04);
     }}
     .fleet-card.green  {{ border-left-color: {COLORS['green']}; }}
     .fleet-card.amber  {{ border-left-color: {COLORS['amber']}; }}
     .fleet-card.red    {{ border-left-color: {COLORS['red']}; }}
     .fleet-card-title {{
         font-size: 15px; font-weight: 700; margin-bottom: 8px;
+        color: {COLORS['navy']};
     }}
     .fleet-card-row {{
         display: flex; justify-content: space-between;
@@ -196,7 +201,7 @@ def inject_css():
         color: {COLORS['text_muted']};
     }}
     .fleet-card-row span:last-child {{
-        color: {COLORS['text']}; font-weight: 600;
+        color: {COLORS['navy']}; font-weight: 600;
     }}
 
     /* ---- Status pills ---- */
@@ -208,13 +213,13 @@ def inject_css():
         font-weight: 600;
         letter-spacing: 0.3px;
     }}
-    .pill-green {{ background: rgba(34,197,94,0.15); color: {COLORS['green']}; }}
-    .pill-amber {{ background: rgba(245,158,11,0.15); color: {COLORS['amber']}; }}
-    .pill-red   {{ background: rgba(239,68,68,0.15);  color: {COLORS['red']}; }}
-    .pill-blue  {{ background: rgba(59,130,246,0.15); color: {COLORS['blue']}; }}
-    .pill-violet{{ background: rgba(139,92,246,0.15); color: {COLORS['violet']}; }}
-    .pill-teal  {{ background: rgba(0,179,166,0.15);  color: {COLORS['accent']}; }}
-    .pill-muted {{ background: rgba(143,160,189,0.12); color: {COLORS['text_muted']}; }}
+    .pill-green {{ background: rgba(22,163,74,0.12);  color: {COLORS['green']}; }}
+    .pill-amber {{ background: rgba(217,119,6,0.12);  color: {COLORS['amber']}; }}
+    .pill-red   {{ background: rgba(220,38,38,0.12);  color: {COLORS['red']}; }}
+    .pill-blue  {{ background: rgba(37,99,235,0.12);  color: {COLORS['blue']}; }}
+    .pill-violet{{ background: rgba(124,58,237,0.12); color: {COLORS['violet']}; }}
+    .pill-teal  {{ background: rgba(0,133,122,0.12);  color: {COLORS['accent']}; }}
+    .pill-muted {{ background: rgba(107,122,143,0.12); color: {COLORS['text_muted']}; }}
 
     /* ---- Streamlit widget overrides ---- */
     .stTabs [data-baseweb="tab-list"] {{
@@ -223,6 +228,7 @@ def inject_css():
         padding: 6px;
         border-radius: 12px;
         border: 1px solid {COLORS['border']};
+        box-shadow: 0 1px 3px rgba(15,41,68,0.04);
     }}
     .stTabs [data-baseweb="tab"] {{
         background: transparent;
@@ -239,8 +245,8 @@ def inject_css():
     }}
 
     .stButton > button {{
-        background: {COLORS['surface_alt']};
-        color: {COLORS['text']};
+        background: {COLORS['surface']};
+        color: {COLORS['navy']};
         border: 1px solid {COLORS['border']};
         border-radius: 10px;
         padding: 8px 16px;
@@ -250,6 +256,7 @@ def inject_css():
     .stButton > button:hover {{
         border-color: {COLORS['accent']};
         color: {COLORS['accent']};
+        background: {COLORS['accent_soft']};
     }}
     .stButton > button[kind="primary"] {{
         background: {COLORS['accent']};
@@ -257,19 +264,21 @@ def inject_css():
         border-color: {COLORS['accent']};
     }}
     .stButton > button[kind="primary"]:hover {{
-        background: #00D4C5;
+        background: #009E91;
         color: white;
+        border-color: #009E91;
     }}
 
     .stDownloadButton > button {{
-        background: {COLORS['surface_alt']};
-        color: {COLORS['text']};
+        background: {COLORS['surface']};
+        color: {COLORS['navy']};
         border: 1px solid {COLORS['border']};
         border-radius: 10px;
     }}
     .stDownloadButton > button:hover {{
         border-color: {COLORS['accent']};
         color: {COLORS['accent']};
+        background: {COLORS['accent_soft']};
     }}
 
     .stSelectbox > div > div, .stTextInput > div > div > input,
@@ -302,36 +311,52 @@ def inject_css():
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 1.2px;
-        color: {COLORS['text']};
+        color: {COLORS['navy']};
     }}
 
     /* Warning / info panels */
     .warn-panel {{
-        background: rgba(245,158,11,0.08);
-        border: 1px solid rgba(245,158,11,0.3);
+        background: rgba(217,119,6,0.06);
+        border: 1px solid rgba(217,119,6,0.25);
         border-left: 3px solid {COLORS['amber']};
         border-radius: 8px;
         padding: 10px 14px;
         margin: 6px 0;
         font-size: 13px;
+        color: {COLORS['navy']};
     }}
     .error-panel {{
-        background: rgba(239,68,68,0.08);
-        border: 1px solid rgba(239,68,68,0.3);
+        background: rgba(220,38,38,0.06);
+        border: 1px solid rgba(220,38,38,0.25);
         border-left: 3px solid {COLORS['red']};
         border-radius: 8px;
         padding: 10px 14px;
         margin: 6px 0;
         font-size: 13px;
+        color: {COLORS['navy']};
     }}
     .info-panel {{
-        background: rgba(0,179,166,0.06);
-        border: 1px solid rgba(0,179,166,0.25);
+        background: rgba(0,133,122,0.05);
+        border: 1px solid rgba(0,133,122,0.2);
         border-left: 3px solid {COLORS['accent']};
         border-radius: 8px;
         padding: 10px 14px;
         margin: 6px 0;
         font-size: 13px;
+        color: {COLORS['navy']};
+    }}
+
+    /* Progress bars */
+    .stProgress > div > div > div > div {{
+        background: {COLORS['accent']};
+    }}
+
+    /* Expanders */
+    .streamlit-expanderHeader {{
+        background: {COLORS['surface']};
+        border: 1px solid {COLORS['border']};
+        border-radius: 8px;
+        color: {COLORS['navy']};
     }}
 
     /* Hide Streamlit chrome */
@@ -395,4 +420,4 @@ def section_header(text: str):
 
 def info_panel(text: str, kind: str = "info"):
     cls = {"info": "info-panel", "warn": "warn-panel", "error": "error-panel"}[kind]
-    st.markdown(f'<div class="{cls}">{text}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="{cls}">{text}</div>', unsafe_allow_html=Tr
