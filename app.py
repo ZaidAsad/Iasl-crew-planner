@@ -2031,6 +2031,214 @@ def tab_ai_optimiser():
                 "When the engine returns a plan, enter each action in the Action Planner tab."
             )
 
+def _build_optimiser_prompt(state, derived, objectives, extra_notes) -> str:
+    """Build a complete, self-contained prompt for an external LLM."""
+    import io as _io
+    labels = derived["labels"]
+    pilots = state["pilots"]
+    actions = state["actions"]
+    fleet_changes = state["fleet_changes"]
+
+    def pilot_line(p):
+        designations = "|".join(p.designations) if p.designations else "—"
+        mgmt = "MGMT(0.5x)" if p.management else "LINE(1.0x)"
+        return (
+            f"  - {p.employee_id}: {p.full_name} | {p.nationality} | "
+            f"{p.fleet} {p.function} | {p.status} | {mgmt} | designations: {designations}"
+        )
+
+    buf = _io.StringIO()
+
+    # 1. Role and task
+    buf.write(
+        "You are an experienced airline crew planning optimiser. Your task is to "
+        "produce a month-by-month training and hiring plan for Island Aviation "
+        "Services Limited (IASL) that satisfies all operational constraints and "
+        "the stated objectives.\n\n"
+    )
+
+    # 2. Domain rules
+    buf.write("=" * 70 + "\n")
+    buf.write("FIXED OPERATIONAL RULES — DO NOT VIOLATE\n")
+    buf.write("=" * 70 + "\n\n")
+    buf.write(
+        "Crew set ratios (1 crew set = 1 Captain + 1 First Officer):\n"
+        "  A330: 7 crew sets per aircraft\n"
+        "  A320: 5 crew sets per aircraft\n"
+        "  ATR72: 6 crew sets per aircraft\n"
+        "  DHC-8: 5 crew sets per aircraft\n\n"
+        "Management Pilot contribution: 0.5 of a line pilot (regular pilot = 1.0).\n"
+        "A pilot On Type Rating or On Leave contributes 0.0.\n\n"
+        "Training transition durations (months):\n"
+        "  DHC-8 Captain -> ATR Captain: 2\n"
+        "  DHC-8 First Officer -> ATR First Officer: 2\n"
+        "  ATR or DHC-8 (Cpt or FO) -> A320 First Officer: 2\n"
+        "  A320 First Officer -> A330 First Officer: 1\n"
+        "  Same-fleet Command Upgrade (FO -> Captain): 1\n"
+        "  A330 FO -> A320 Captain (compound: type rating + command upgrade): 2\n"
+        "  Cadet hire -> active ATR First Officer: 2 (training lag)\n\n"
+        "Command Upgrade eligibility:\n"
+        "  A330 Captain upgrade: candidates are A330 FOs or A320 Captains.\n"
+        "  A320 Captain upgrade: candidates are A320 FOs or A330 FOs "
+        "(A330 FO path is a 2-month compound action).\n"
+        "  ATR / DHC-8 Captain upgrade: candidates are FOs on the same fleet.\n\n"
+        "Training modes:\n"
+        "  Internal: one destination-fleet Captain acts as instructor AND is "
+        "off line ops for the duration. Up to 2 trainees allowed.\n"
+        "  External: no internal instructor consumed. Up to 2 trainees allowed.\n\n"
+        "Cadet rule: cadets are hired ONLY as ATR First Officers, with a 2-month "
+        "type rating before activation.\n\n"
+        "Gap bands (requirement minus availability):\n"
+        "  gap < 1 month -> green (met)\n"
+        "  1 <= gap < 2 -> amber (1 short)\n"
+        "  gap >= 2 -> red (2+ short)\n\n"
+    )
+
+    # 3. Objectives
+    buf.write("=" * 70 + "\n")
+    buf.write("OBJECTIVES FOR THIS PLAN\n")
+    buf.write("=" * 70 + "\n\n")
+    obj_lines = []
+    if objectives["close_gaps"]:
+        obj_lines.append("- Close all requirement gaps within the planning horizon.")
+    if objectives["localise"]:
+        obj_lines.append(
+            "- Maximise localisation: replace expat pilots with Maldivian locals "
+            "wherever feasible given training routes."
+        )
+    if objectives["phase_out_dhc8"]:
+        obj_lines.append(
+            "- Phase out the DHC-8 fleet. Transition DHC-8 crews to ATR72 "
+            "(same function) or A320 First Officer positions."
+        )
+    if objectives["minimise_external_cost"]:
+        obj_lines.append(
+            "- Minimise External training where Internal is feasible "
+            "(i.e., when a destination-fleet Captain is available as instructor)."
+        )
+    if objectives["avoid_conflicts"]:
+        obj_lines.append(
+            "- No named pilot may be assigned to two overlapping actions."
+        )
+    if objectives["stagger_trainings"]:
+        obj_lines.append(
+            f"- Stagger trainings so no fleet has more than "
+            f"{objectives['max_concurrent_per_fleet']} concurrent trainings at any time."
+        )
+    buf.write("\n".join(obj_lines) + "\n\n")
+
+    # 4. Current state
+    buf.write("=" * 70 + "\n")
+    buf.write("CURRENT STATE\n")
+    buf.write("=" * 70 + "\n\n")
+
+    buf.write(
+        f"Planning period: {labels[0]} to {labels[-1]} "
+        f"({state['horizon']} months)\n\n"
+    )
+
+    buf.write("Initial aircraft count (month 1):\n")
+    for f in FLEETS:
+        buf.write(f"  {f}: {state['initial_aircraft'][f]} aircraft\n")
+    buf.write("\n")
+
+    if fleet_changes:
+        buf.write("Scheduled fleet changes:\n")
+        for c in sorted(fleet_changes, key=lambda x: x.month_index):
+            verb = "ACQUIRE" if c.delta > 0 else "DISPOSE"
+            mo = labels[c.month_index] if 0 <= c.month_index < len(labels) else f"M{c.month_index}"
+            note = f" — {c.note}" if c.note else ""
+            buf.write(f"  {mo}: {verb} 1x {c.fleet}{note}\n")
+        buf.write("\n")
+
+    buf.write("Month-by-month aircraft count:\n")
+    buf.write("  Month          | " + " | ".join(FLEETS) + "\n")
+    for i, lbl in enumerate(labels):
+        row = f"  {lbl:14s} | " + " | ".join(
+            f"{derived['ac_counts'][f][i]:>5d}" for f in FLEETS
+        )
+        buf.write(row + "\n")
+    buf.write("\n")
+
+    buf.write("PILOT REGISTRY (all pilots):\n\n")
+    for f in FLEETS:
+        for fn in FUNCTIONS:
+            group = [p for p in pilots if p.fleet == f and p.function == fn]
+            if not group:
+                continue
+            locals_n = sum(1 for p in group if p.nationality == "Local")
+            expats_n = sum(1 for p in group if p.nationality == "Expat")
+            mgmt_n = sum(1 for p in group if p.management)
+            buf.write(
+                f"{f} {fn} — {len(group)} pilots "
+                f"({locals_n} Local, {expats_n} Expat, {mgmt_n} Management):\n"
+            )
+            for p in sorted(group, key=lambda x: (x.nationality, x.full_name)):
+                buf.write(pilot_line(p) + "\n")
+            buf.write("\n")
+
+    # 5. Current requirement vs availability
+    buf.write("CURRENT REQUIREMENT vs AVAILABILITY (pre-plan):\n\n")
+    buf.write("  Fleet   Function   " + "  ".join(f"{lbl:>10s}" for lbl in labels) + "\n")
+    for f in FLEETS:
+        for fn in FUNCTIONS:
+            req = derived["req"][f][fn]
+            av = derived["avail"][f][fn]
+            cells = "  ".join(f"{req[i]:>3d}/{av[i]:>5.1f}" for i in range(len(labels)))
+            buf.write(f"  {f:6s}  {fn[:3]:>8s}   {cells}\n")
+    buf.write("\n")
+
+    # 6. Existing planned actions
+    if actions:
+        buf.write("ALREADY-PLANNED ACTIONS (treat as fixed, build on top of these):\n\n")
+        for a in sorted(actions, key=lambda x: x.start_month):
+            mo = labels[a.start_month] if 0 <= a.start_month < len(labels) else f"M{a.start_month}"
+            buf.write(
+                f"  {mo} | {a.action_type} | "
+                f"from {a.from_fleet} {a.from_function} -> to {a.to_fleet} {a.to_function} | "
+                f"{a.duration}mo | mode={a.mode} | "
+                f"instructor={a.instructor_id or '—'} | "
+                f"trainees={','.join(a.trainee_ids) if a.trainee_ids else '—'} | "
+                f"{a.note}\n"
+            )
+        buf.write("\n")
+
+    # 7. Extra notes
+    if extra_notes:
+        buf.write("=" * 70 + "\n")
+        buf.write("ADDITIONAL INSTRUCTIONS FROM THE PLANNER\n")
+        buf.write("=" * 70 + "\n\n")
+        buf.write(extra_notes + "\n\n")
+
+    # 8. Output format contract
+    buf.write("=" * 70 + "\n")
+    buf.write("REQUIRED OUTPUT FORMAT\n")
+    buf.write("=" * 70 + "\n\n")
+    buf.write(
+        "Return your plan as a numbered list of actions. For EACH action, "
+        "provide the following fields on separate lines, using this exact format:\n\n"
+        "Action N:\n"
+        "  Type: <Type Rating | Command Upgrade | Cadet Hire | Expat Hire | Local Hire>\n"
+        "  Start month: <YYYY-MMM from the planning horizon>\n"
+        "  Duration: <months>\n"
+        "  Mode: <Internal | External | —>\n"
+        "  From: <fleet> <function>        (omit for hires)\n"
+        "  To: <fleet> <function>\n"
+        "  Instructor: <Employee ID or TBD>  (only for Internal mode)\n"
+        "  Trainees: <Employee IDs comma-separated, or TBD-1/TBD-2>\n"
+        "  Rationale: <one-line reason tied to an objective>\n\n"
+        "After the list, provide:\n"
+        "  1. A summary table of monthly requirement-vs-availability after your plan is applied.\n"
+        "  2. A brief risk assessment (what could go wrong, what slack remains).\n"
+        "  3. Any assumptions you had to make.\n\n"
+        "Be concrete. Use actual Employee IDs from the registry above wherever "
+        "possible — only use TBD placeholders when no suitable named pilot exists. "
+        "Respect all fixed operational rules. If an objective conflicts with the "
+        "rules, state the conflict explicitly and pick the rule-compliant option.\n"
+    )
+
+    return buf.getvalue()
+
 
 def _state_fingerprint() -> str:
     """
