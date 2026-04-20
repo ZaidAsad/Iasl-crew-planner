@@ -895,12 +895,13 @@ def tab_action_planner():
     action_type = st.selectbox("Action type", ACTION_TYPES, key="new_action_type")
 
     with st.form("add_action", clear_on_submit=False):
-        if action_type == "Type Rating":        _form_type_rating(d)
-        elif action_type == "Command Upgrade":  _form_command_upgrade(d)
-        elif action_type == "Cadet Hire":       _form_hire(d, "Cadet Hire")
-        elif action_type == "Expat Hire":       _form_hire(d, "Expat Hire")
-        elif action_type == "Local Hire":       _form_hire(d, "Local Hire")
-        elif action_type == "Fleet Change":     _form_fleet_change(d)
+        if action_type == "Type Rating":           _form_type_rating(d)
+        elif action_type == "Command Upgrade":     _form_command_upgrade(d)
+        elif action_type == "Cadet Hire":          _form_hire(d, "Cadet Hire")
+        elif action_type == "Expat Hire":          _form_hire(d, "Expat Hire")
+        elif action_type == "Local Hire":          _form_hire(d, "Local Hire")
+        elif action_type == "Fleet Change":        _form_fleet_change(d)
+        elif action_type == "Pilot Termination":   _form_pilot_termination(d)
 
     if d["conflicts"]:
         section_header("Conflicts")
@@ -922,6 +923,9 @@ def tab_action_planner():
             title += f"  ·  → {a.to_fleet} {a.to_function} ({a.new_pilot_name or 'TBD'})"
         elif a.action_type == "Fleet Change":
             title += f"  ·  {a.from_fleet}"
+        elif a.action_type == "Pilot Termination":
+            n_pilots = len(a.trainee_ids)
+            title += f"  ·  {n_pilots} pilot{'s' if n_pilots != 1 else ''} departing"
 
         with st.expander(title):
             c1, c2 = st.columns([5, 1])
@@ -988,6 +992,62 @@ def _pilot_picker(label, key, fleet_filter=None, function_filter=None,
                               placeholder="Type a name, ID, fleet, or function…")
     return [options_map[s] for s in selected]
 
+def _form_pilot_termination(d):
+    ss = st.session_state
+
+    st.markdown(
+        "Schedule the departure of one or more pilots. From the termination "
+        "month onward, they no longer contribute to availability on any fleet. "
+        "They remain in the registry so historical actions still reference them "
+        "meaningfully — delete the termination action if you need to bring them back."
+    )
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        term_month = _month_selector(d, "term_start")
+    with c2:
+        reason = st.selectbox(
+            "Reason",
+            ["Contract end", "Resignation", "Retirement",
+             "Localisation replacement", "Other"],
+            key="term_reason",
+        )
+
+    st.markdown("**Pilots to terminate** (pick one or more)")
+    pilots = _pilot_picker(
+        "Select pilots", "term_pilots",
+        allow_tbd=False,
+        max_selections=10,
+    )
+
+    note = st.text_input("Note (optional)", key="term_note", placeholder="Context or replacement plan…")
+
+    if st.form_submit_button("Schedule termination(s)", type="primary"):
+        if not pilots:
+            st.error("Pick at least one pilot.")
+            return
+
+        pilot_by_id = {p.employee_id: p for p in ss.pilots}
+        # Show confirmation summary in session for the user's peace of mind
+        summary_bits = []
+        for pid in pilots:
+            p = pilot_by_id.get(pid)
+            if p:
+                summary_bits.append(f"{p.full_name} ({p.fleet} {p.function}, {p.nationality})")
+
+        combined_note = f"Reason: {reason}"
+        if note.strip():
+            combined_note += f" — {note.strip()}"
+
+        ss.actions.append(PlannedAction(
+            id=new_id("act"), action_type="Pilot Termination",
+            start_month=term_month, duration=0, mode="—",
+            trainee_ids=list(pilots),
+            note=combined_note,
+        ))
+        st.success(f"Scheduled termination of {len(pilots)} pilot(s): {', '.join(summary_bits[:3])}"
+                   + (f" and {len(summary_bits) - 3} more" if len(summary_bits) > 3 else ""))
+        st.rerun()
 
 def _form_type_rating(d):
     ss = st.session_state
@@ -1421,7 +1481,7 @@ def tab_localisation():
     with c1: metric_card("Overall local %", f"{loc['local_pct']:.1f}%")
     with c2: metric_card("Local pilots", loc["local"])
     with c3: metric_card("Expat pilots", loc["expat"])
-    with c4: metric_card("Expats w/ feeder", _expats_with_feeder(ss.pilots))
+    with c4: metric_card("Expats w/ feeder", _expats_with_feeder(ss.pilots, ss.actions))
 
     section_header("Per-fleet local share")
     for f in FLEETS:
@@ -1442,7 +1502,7 @@ def tab_localisation():
     else:
         rows = []
         for ex in expats:
-            cands = eligible_feeders_for(ex, ss.pilots)
+            cands = eligible_feeders_for(ex, ss.pilots, ss.actions)
             best = cands[0] if cands else None
             rows.append({
                 "Expat ID": ex.employee_id,
@@ -1458,7 +1518,7 @@ def tab_localisation():
         st.dataframe(_safe_df(rows), hide_index=True, height=360, width="stretch")
 
     section_header("Recommended next actions")
-    recs = _recommended_localisation_actions(ss.pilots)
+    recs = _recommended_localisation_actions(ss.pilots, ss.actions)
     if not recs:
         info_panel("No recommendations.")
     else:
@@ -1468,16 +1528,16 @@ def tab_localisation():
                        f"in <b>{r['months']} months</b>.", kind="info")
 
 
-def _expats_with_feeder(pilots) -> int:
+def _expats_with_feeder(pilots, actions=None) -> int:
     return sum(1 for p in pilots
-               if p.nationality == "Expat" and eligible_feeders_for(p, pilots))
+               if p.nationality == "Expat" and eligible_feeders_for(p, pilots, actions))
 
 
-def _recommended_localisation_actions(pilots) -> list[dict]:
+def _recommended_localisation_actions(pilots, actions=None) -> list[dict]:
     recs, used = [], set()
     for ex in pilots:
         if ex.nationality != "Expat": continue
-        for c in eligible_feeders_for(ex, pilots):
+        for c in eligible_feeders_for(ex, pilots, actions):
             if c["pilot_id"] in used: continue
             recs.append({"expat": ex.full_name,
                          "position": f"{ex.fleet} {ex.function}",
