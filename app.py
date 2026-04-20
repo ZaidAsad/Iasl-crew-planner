@@ -1,5 +1,5 @@
 """
-IASL Crew Planning Portal — main Streamlit entry point (consolidated).
+IASL Crew Planning Portal — main Streamlit entry point (fully consolidated).
 """
 
 from __future__ import annotations
@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import io as _io
 import json
+import math
 from datetime import date, datetime
 
 import pandas as pd
@@ -104,7 +105,6 @@ _init_state()
 
 
 def _autosave():
-    """Keep a serialised backup of the full plan in session state."""
     try:
         st.session_state["_autosave_payload"] = serialise_state(current_state_payload())
     except Exception:
@@ -137,10 +137,26 @@ def derived():
             "avail": avail, "gaps": gaps, "conflicts": conflicts, "loc": loc}
 
 
-def _safe_df(rows: list[dict] | pd.DataFrame) -> pd.DataFrame:
-    """Convert rows to a DataFrame with all string columns — Arrow-safe."""
+def _safe_df(rows) -> pd.DataFrame:
     df = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
     return df.astype(str)
+
+
+def _hex_to_rgb(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _fleet_function_color(fleet: str, function: str, alpha: float = 1.0) -> str:
+    base = FLEET_COLORS[fleet]
+    r, g, b = _hex_to_rgb(base)
+    if function == "Captain":
+        r, g, b = int(r * 0.65), int(g * 0.65), int(b * 0.65)
+    else:
+        r = int(r + (255 - r) * 0.45)
+        g = int(g + (255 - g) * 0.45)
+        b = int(b + (255 - b) * 0.45)
+    return f"rgba({r},{g},{b},{alpha})"
 
 
 # ---------------------------------------------------------------------------
@@ -676,40 +692,49 @@ def tab_fleet_planner():
 
 
 # ---------------------------------------------------------------------------
-# TAB 4 — Timeline (multi-view, multi-fleet, shaded by function)
+# TAB 4 — Timeline
 # ---------------------------------------------------------------------------
-def _hex_to_rgb(h: str) -> tuple[int, int, int]:
-    h = h.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-
-
-def _fleet_function_color(fleet: str, function: str, alpha: float = 1.0) -> str:
-    base = FLEET_COLORS[fleet]
-    r, g, b = _hex_to_rgb(base)
-    if function == "Captain":
-        r, g, b = int(r * 0.65), int(g * 0.65), int(b * 0.65)
-    else:
-        r = int(r + (255 - r) * 0.45)
-        g = int(g + (255 - g) * 0.45)
-        b = int(b + (255 - b) * 0.45)
-    return f"rgba({r},{g},{b},{alpha})"
-
-
-def _add_action_markers(fig, d, fleets):
+def _tl_add_action_markers_rich(fig, d, fleets):
     ss = st.session_state
-    acts = [a for a in ss.actions if a.from_fleet in fleets or a.to_fleet in fleets]
+    pilot_by_id = {p.employee_id: p for p in ss.pilots}
+    acts = []
+    for a in ss.actions:
+        touches = a.from_fleet in fleets or a.to_fleet in fleets
+        if a.action_type == "Pilot Termination":
+            touches = any(
+                pilot_by_id.get(tid) and pilot_by_id[tid].fleet in fleets
+                for tid in a.trainee_ids if not tid.startswith("TBD")
+            )
+        if touches:
+            acts.append(a)
+
     for a in acts:
-        if a.start_month < 0 or a.start_month >= len(d["labels"]): continue
+        if a.start_month < 0 or a.start_month >= len(d["labels"]):
+            continue
         start_lbl = d["labels"][a.start_month]
         end_idx = min(a.start_month + max(1, a.duration), len(d["labels"]) - 1)
         end_lbl = d["labels"][end_idx]
+        color_map = {
+            "Type Rating": COLORS["blue"],
+            "Command Upgrade": COLORS["violet"],
+            "Cadet Hire": COLORS["green"],
+            "Local Hire": COLORS["green"],
+            "Expat Hire": COLORS["amber"],
+            "Pilot Termination": COLORS["red"],
+            "Fleet Change": COLORS["accent"],
+        }
+        col = color_map.get(a.action_type, COLORS["accent"])
+        h = col.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        fillcolor = f"rgba({r},{g},{b},0.10)"
         fig.add_vrect(
             x0=start_lbl, x1=end_lbl,
-            fillcolor=COLORS["accent"], opacity=0.08,
+            fillcolor=fillcolor,
             layer="below", line_width=0,
             annotation_text=a.action_type[:3],
             annotation_position="top left",
-            annotation_font_size=9, annotation_font_color=COLORS["accent"],
+            annotation_font_size=9,
+            annotation_font_color=col,
         )
 
 
@@ -719,20 +744,56 @@ def tab_timeline():
 
     section_header("Planning Timeline")
 
+    total_red = sum(
+        1 for f in FLEETS for fn in FUNCTIONS for m in range(ss.horizon)
+        if gap_band(d["gaps"][f][fn][m]) == "red"
+    )
+    total_amber = sum(
+        1 for f in FLEETS for fn in FUNCTIONS for m in range(ss.horizon)
+        if gap_band(d["gaps"][f][fn][m]) == "amber"
+    )
+    first_red_month = None
+    for m in range(ss.horizon):
+        for f in FLEETS:
+            for fn in FUNCTIONS:
+                if gap_band(d["gaps"][f][fn][m]) == "red":
+                    first_red_month = m
+                    break
+            if first_red_month is not None: break
+        if first_red_month is not None: break
+
     c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        metric_card("Horizon", f"{ss.horizon} months",
+                    f"{d['labels'][0]} → {d['labels'][-1]}")
+    with c2: metric_card("Amber cells", total_amber, "≥ 1 short across the grid")
+    with c3: metric_card("Red cells", total_red, "≥ 2 short across the grid")
+    with c4:
+        metric_card(
+            "First red month",
+            d["labels"][first_red_month] if first_red_month is not None else "—",
+            "earliest critical shortfall" if first_red_month is not None else "plan is green",
+        )
+
+    section_header("View controls")
+    c1, c2, c3, c4 = st.columns([2.5, 2, 2, 1.5])
     with c1:
         sel_fleets = st.multiselect("Fleets", FLEETS, default=FLEETS, key="tl_fleets")
     with c2:
         sel_funcs = st.multiselect("Functions", FUNCTIONS, default=FUNCTIONS, key="tl_funcs")
     with c3:
         view_mode = st.selectbox(
-            "View",
-            ["Requirement vs Availability", "Gap (shortfall)",
-             "Nationality split", "Management vs line pilots"],
+            "Chart type",
+            ["Requirement vs Availability",
+             "Gap (shortfall)",
+             "Stacked composition (area)",
+             "Heatmap of gaps",
+             "Nationality split",
+             "Management vs line pilots"],
             key="tl_view",
         )
     with c4:
-        show_actions = st.checkbox("Mark planned actions", value=True, key="tl_show_actions")
+        show_actions = st.checkbox("Mark actions", value=True, key="tl_show_actions")
 
     if not sel_fleets or not sel_funcs:
         info_panel("Select at least one fleet and one function."); return
@@ -741,17 +802,29 @@ def tab_timeline():
         _tl_req_vs_avail(d, sel_fleets, sel_funcs, show_actions)
     elif view_mode == "Gap (shortfall)":
         _tl_gap(d, sel_fleets, sel_funcs, show_actions)
+    elif view_mode == "Stacked composition (area)":
+        _tl_stacked_composition(d, sel_fleets, sel_funcs, show_actions)
+    elif view_mode == "Heatmap of gaps":
+        _tl_heatmap(d, sel_fleets, sel_funcs)
     elif view_mode == "Nationality split":
         _tl_nationality(d, sel_fleets, sel_funcs)
     elif view_mode == "Management vs line pilots":
         _tl_management(d, sel_fleets, sel_funcs)
 
     section_header("Planned actions in view")
-    rel = [a for a in ss.actions if a.from_fleet in sel_fleets or a.to_fleet in sel_fleets]
+    rel = [
+        a for a in ss.actions
+        if a.from_fleet in sel_fleets or a.to_fleet in sel_fleets
+        or (a.action_type == "Pilot Termination" and any(
+            (p.fleet in sel_fleets) for t in a.trainee_ids
+            for p in ss.pilots if p.employee_id == t
+        ))
+    ]
     if not rel:
         info_panel("No planned actions touch the selected fleets.")
     else:
         rows = []
+        pilot_by_id = {p.employee_id: p for p in ss.pilots}
         for a in sorted(rel, key=lambda x: x.start_month):
             detail = ""
             if a.action_type == "Type Rating":
@@ -760,11 +833,19 @@ def tab_timeline():
                 detail = f"{a.from_fleet} FO → {a.to_fleet} CPT"
             elif a.action_type in ("Cadet Hire", "Expat Hire", "Local Hire"):
                 detail = f"{a.new_pilot_name or 'TBD'} → {a.to_fleet} {a.to_function}"
+            elif a.action_type == "Pilot Termination":
+                names = []
+                for tid in a.trainee_ids[:3]:
+                    p = pilot_by_id.get(tid)
+                    names.append(p.full_name if p else tid)
+                detail = ", ".join(names) + (f" and {len(a.trainee_ids) - 3} more"
+                                             if len(a.trainee_ids) > 3 else "")
             rows.append({
                 "Month": d["labels"][a.start_month] if 0 <= a.start_month < len(d["labels"]) else f"M{a.start_month}",
-                "Type": a.action_type, "Detail": detail,
-                "Duration": f"{a.duration}mo", "Mode": a.mode,
-                "Trainees": ", ".join(a.trainee_ids) if a.trainee_ids else "—",
+                "Type": a.action_type,
+                "Detail": detail,
+                "Duration": f"{a.duration}mo" if a.duration else "—",
+                "Mode": a.mode,
             })
         st.dataframe(_safe_df(rows), hide_index=True, width="stretch")
 
@@ -784,26 +865,36 @@ def _tl_req_vs_avail(d, fleets, funcs, show_actions):
     for f in fleets:
         for fn in funcs:
             col = _fleet_function_color(f, fn)
-            col_light = _fleet_function_color(f, fn, 0.25)
+            col_light = _fleet_function_color(f, fn, 0.18)
             fig.add_trace(go.Scatter(
                 x=d["labels"], y=d["req"][f][fn],
-                name=f"{f} {fn} — required", mode="lines",
+                name=f"{f} {fn[:3]} req.",
+                mode="lines",
                 line=dict(dash="dash", width=2, color=col),
                 hovertemplate=f"<b>{f} {fn}</b><br>%{{x}}<br>Required: %{{y}}<extra></extra>",
+                legendgroup=f"{f}-{fn}",
             ))
             fig.add_trace(go.Scatter(
                 x=d["labels"], y=d["avail"][f][fn],
-                name=f"{f} {fn} — available", mode="lines+markers",
-                line=dict(width=2.5, color=col), marker=dict(size=5, color=col),
+                name=f"{f} {fn[:3]} avail.",
+                mode="lines+markers",
+                line=dict(width=2.8, color=col, shape="spline", smoothing=0.4),
+                marker=dict(size=6, color=col, line=dict(color="white", width=1.2)),
                 fill="tozeroy", fillcolor=col_light,
                 hovertemplate=f"<b>{f} {fn}</b><br>%{{x}}<br>Available: %{{y:.1f}}<extra></extra>",
+                legendgroup=f"{f}-{fn}",
             ))
-    if show_actions: _add_action_markers(fig, d, fleets)
-    fig.update_layout(height=460, hovermode="x unified",
-                      xaxis_title="Month", yaxis_title="Pilots",
-                      legend=dict(orientation="h", yanchor="bottom", y=-0.35,
-                                  xanchor="center", x=0.5, font=dict(size=10)))
-    fig.update_xaxes(tickangle=-45)
+    if show_actions: _tl_add_action_markers_rich(fig, d, fleets)
+    fig.update_layout(
+        height=500, hovermode="x unified",
+        xaxis=dict(title="", showgrid=True, gridcolor=COLORS["border"], tickangle=-45),
+        yaxis=dict(title="Pilots", showgrid=True, gridcolor=COLORS["border"], rangemode="tozero"),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.4,
+                    xanchor="center", x=0.5, font=dict(size=10),
+                    bgcolor="rgba(255,255,255,0.6)"),
+        margin=dict(l=60, r=30, t=30, b=120),
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -811,20 +902,136 @@ def _tl_gap(d, fleets, funcs, show_actions):
     fig = go.Figure()
     for f in fleets:
         for fn in funcs:
+            col = _fleet_function_color(f, fn)
+            bar_colors = []
+            for g in d["gaps"][f][fn]:
+                band = gap_band(g)
+                if band == "green":
+                    bar_colors.append(_fleet_function_color(f, fn, 0.35))
+                elif band == "amber":
+                    bar_colors.append(COLORS["amber"])
+                else:
+                    bar_colors.append(COLORS["red"])
             fig.add_trace(go.Bar(
-                x=d["labels"], y=d["gaps"][f][fn], name=f"{f} {fn}",
-                marker=dict(color=_fleet_function_color(f, fn), line=dict(width=0)),
+                x=d["labels"], y=d["gaps"][f][fn], name=f"{f} {fn[:3]}",
+                marker=dict(color=bar_colors, line=dict(color=col, width=0.5)),
                 hovertemplate=f"<b>{f} {fn}</b><br>%{{x}}<br>Gap: %{{y:.1f}}<extra></extra>",
             ))
-    if show_actions: _add_action_markers(fig, d, fleets)
-    fig.add_hline(y=1, line_dash="dot", line_color=COLORS["amber"])
-    fig.add_hline(y=2, line_dash="dot", line_color=COLORS["red"])
-    fig.update_layout(height=420, barmode="group", hovermode="x unified",
-                      xaxis_title="Month", yaxis_title="Pilot shortfall",
-                      legend=dict(orientation="h", yanchor="bottom", y=-0.3,
-                                  xanchor="center", x=0.5, font=dict(size=10)))
-    fig.update_xaxes(tickangle=-45)
+    if show_actions: _tl_add_action_markers_rich(fig, d, fleets)
+    fig.add_hline(y=1, line_dash="dot", line_color=COLORS["amber"], line_width=1.5,
+                  annotation_text="Amber", annotation_position="right",
+                  annotation_font_color=COLORS["amber"], annotation_font_size=10)
+    fig.add_hline(y=2, line_dash="dot", line_color=COLORS["red"], line_width=1.5,
+                  annotation_text="Red", annotation_position="right",
+                  annotation_font_color=COLORS["red"], annotation_font_size=10)
+    fig.update_layout(
+        height=460, barmode="group", hovermode="x unified",
+        xaxis=dict(title="", tickangle=-45, gridcolor=COLORS["border"]),
+        yaxis=dict(title="Pilot shortfall", gridcolor=COLORS["border"]),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35,
+                    xanchor="center", x=0.5, font=dict(size=10)),
+        margin=dict(l=60, r=80, t=30, b=110),
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
     st.plotly_chart(fig, use_container_width=True)
+
+
+def _tl_stacked_composition(d, fleets, funcs, show_actions):
+    fig = go.Figure()
+    total_req = [0] * len(d["labels"])
+    for f in fleets:
+        for fn in funcs:
+            for i in range(len(d["labels"])):
+                total_req[i] += d["req"][f][fn][i]
+
+    for f in fleets:
+        for fn in funcs:
+            col = _fleet_function_color(f, fn, 0.75)
+            fig.add_trace(go.Scatter(
+                x=d["labels"], y=d["avail"][f][fn],
+                name=f"{f} {fn[:3]}",
+                mode="lines",
+                line=dict(width=0.5, color=_fleet_function_color(f, fn)),
+                stackgroup="avail", fillcolor=col,
+                hovertemplate=f"<b>{f} {fn}</b><br>%{{x}}<br>Available: %{{y:.1f}}<extra></extra>",
+            ))
+
+    fig.add_trace(go.Scatter(
+        x=d["labels"], y=total_req, name="Total required",
+        mode="lines+markers",
+        line=dict(width=3, color=COLORS["navy"], dash="dash"),
+        marker=dict(size=6, color=COLORS["navy"]),
+        hovertemplate="<b>Total required</b><br>%{x}<br>%{y}<extra></extra>",
+    ))
+
+    if show_actions: _tl_add_action_markers_rich(fig, d, fleets)
+
+    fig.update_layout(
+        height=500, hovermode="x unified",
+        xaxis=dict(title="", tickangle=-45, gridcolor=COLORS["border"]),
+        yaxis=dict(title="Pilots (stacked availability)", gridcolor=COLORS["border"]),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35,
+                    xanchor="center", x=0.5, font=dict(size=10)),
+        margin=dict(l=60, r=30, t=30, b=110),
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Stacked areas show how much of your total pilot pool comes from each "
+        "fleet × function across the horizon. The dashed line is the total "
+        "requirement — when the stacked area dips below it, you have a shortfall."
+    )
+
+
+def _tl_heatmap(d, fleets, funcs):
+    rows_labels = []
+    z_values = []
+    text_cells = []
+    for f in fleets:
+        for fn in funcs:
+            rows_labels.append(f"{f} · {fn[:3]}")
+            row_z, row_txt = [], []
+            for m in range(len(d["labels"])):
+                g = d["gaps"][f][fn][m]
+                req = d["req"][f][fn][m]
+                av = d["avail"][f][fn][m]
+                if g < 0.01:
+                    row_z.append(0)
+                elif g < 1:
+                    row_z.append(1)
+                elif g < 2:
+                    row_z.append(2)
+                else:
+                    row_z.append(3)
+                row_txt.append(f"{req:.0f}/{av:.1f}" if av < req else f"✓ {av:.1f}")
+            z_values.append(row_z)
+            text_cells.append(row_txt)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z_values, x=d["labels"], y=rows_labels,
+        colorscale=[
+            [0.00, "#DCF5E3"],
+            [0.33, "#FEF3C7"],
+            [0.66, "#FEE2B8"],
+            [1.00, "#FCA5A5"],
+        ],
+        zmin=0, zmax=3,
+        text=text_cells, texttemplate="%{text}",
+        textfont=dict(size=9, color=COLORS["navy"], family="Inter"),
+        hovertemplate="<b>%{y}</b><br>%{x}<br>Req/Avail: %{text}<extra></extra>",
+        xgap=2, ygap=3, showscale=False,
+    ))
+    fig.update_layout(
+        height=max(300, len(rows_labels) * 42 + 80),
+        margin=dict(l=90, r=20, t=30, b=90),
+        xaxis=dict(tickangle=-45, tickfont=dict(size=10), showgrid=False, side="top"),
+        yaxis=dict(tickfont=dict(size=11), autorange="reversed", showgrid=False),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Each cell shows requirement/availability for one fleet × function × "
+        "month. Green = met, yellow = small gap, orange = amber, red = red band."
+    )
 
 
 def _tl_nationality(d, fleets, funcs):
@@ -836,20 +1043,46 @@ def _tl_nationality(d, fleets, funcs):
             group = [p for p in ss.pilots if p.fleet == f and p.function == fn and p.status == "Active"]
             local_vals.append(sum(1 for p in group if p.nationality == "Local"))
             expat_vals.append(sum(1 for p in group if p.nationality == "Expat"))
-            cats.append(f"{f}<br>{fn[:3]}")
+            cats.append(f"{f}<br><span style='font-size:10px;color:{COLORS['text_muted']}'>{fn[:3]}</span>")
             cols_local.append(_fleet_function_color(f, fn, 1.0))
             cols_expat.append(_fleet_function_color(f, fn, 0.4))
-    fig.add_trace(go.Bar(x=cats, y=local_vals, name="Local",
-                         marker=dict(color=cols_local),
-                         text=local_vals, textposition="inside"))
-    fig.add_trace(go.Bar(x=cats, y=expat_vals, name="Expat",
-                         marker=dict(color=cols_expat,
-                                     pattern=dict(shape="/", size=6, solidity=0.3)),
-                         text=expat_vals, textposition="inside"))
-    fig.update_layout(height=420, barmode="stack",
-                      xaxis_title="Fleet × Function", yaxis_title="Active pilots",
-                      legend=dict(orientation="h", yanchor="bottom", y=-0.25,
-                                  xanchor="center", x=0.5))
+
+    pct_labels = []
+    for l, e in zip(local_vals, expat_vals):
+        total = l + e
+        pct_labels.append(f"{(l / total * 100):.0f}%" if total > 0 else "—")
+
+    fig.add_trace(go.Bar(
+        x=cats, y=local_vals, name="Local",
+        marker=dict(color=cols_local, line=dict(color="white", width=1)),
+        text=local_vals, textposition="inside",
+        textfont=dict(color="white", size=11, family="Inter"),
+        hovertemplate="<b>%{x}</b><br>Local: %{y}<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=cats, y=expat_vals, name="Expat",
+        marker=dict(color=cols_expat,
+                    pattern=dict(shape="/", size=5, solidity=0.25),
+                    line=dict(color="white", width=1)),
+        text=expat_vals, textposition="inside",
+        textfont=dict(color="white", size=11, family="Inter"),
+        hovertemplate="<b>%{x}</b><br>Expat: %{y}<extra></extra>",
+    ))
+    for i, (cat, pct) in enumerate(zip(cats, pct_labels)):
+        fig.add_annotation(
+            x=cat, y=local_vals[i] + expat_vals[i] + 0.5,
+            text=f"<b>{pct}</b>", showarrow=False,
+            font=dict(size=11, color=COLORS["accent"]),
+        )
+
+    fig.update_layout(
+        height=460, barmode="stack",
+        xaxis=dict(title="", gridcolor=COLORS["border"]),
+        yaxis=dict(title="Active pilots", gridcolor=COLORS["border"]),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5),
+        margin=dict(l=60, r=30, t=40, b=80),
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -864,25 +1097,44 @@ def _tl_management(d, fleets, funcs):
             mgmt = sum(1 for p in group if p.management)
             line_vals.append(line); mgmt_vals.append(mgmt)
             eff_vals.append(line + 0.5 * mgmt)
-            cats.append(f"{f}<br>{fn[:3]}")
+            cats.append(f"{f}<br><span style='font-size:10px;color:{COLORS['text_muted']}'>{fn[:3]}</span>")
             cols.append(_fleet_function_color(f, fn))
-    fig.add_trace(go.Bar(x=cats, y=line_vals, name="Line pilots (1.0)",
-                         marker=dict(color=cols), text=line_vals, textposition="inside"))
-    fig.add_trace(go.Bar(x=cats, y=mgmt_vals, name="Management (0.5)",
-                         marker=dict(color=cols,
-                                     pattern=dict(shape="x", size=6, solidity=0.3)),
-                         text=mgmt_vals, textposition="inside"))
-    fig.add_trace(go.Scatter(x=cats, y=eff_vals, name="Effective weight",
-                             mode="markers+text",
-                             marker=dict(size=14, color=COLORS["navy"], symbol="diamond"),
-                             text=[f"{v:.1f}" for v in eff_vals],
-                             textposition="top center"))
-    fig.update_layout(height=460, barmode="stack",
-                      xaxis_title="Fleet × Function", yaxis_title="Pilots",
-                      legend=dict(orientation="h", yanchor="bottom", y=-0.25,
-                                  xanchor="center", x=0.5))
-    st.plotly_chart(fig, use_container_width=True)
 
+    fig.add_trace(go.Bar(
+        x=cats, y=line_vals, name="Line pilots (1.0)",
+        marker=dict(color=cols, line=dict(color="white", width=1)),
+        text=line_vals, textposition="inside",
+        textfont=dict(color="white", size=11, family="Inter"),
+        hovertemplate="<b>%{x}</b><br>Line: %{y}<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        x=cats, y=mgmt_vals, name="Management (0.5)",
+        marker=dict(color=cols,
+                    pattern=dict(shape="x", size=5, solidity=0.25),
+                    line=dict(color="white", width=1)),
+        text=mgmt_vals, textposition="inside",
+        textfont=dict(color="white", size=11, family="Inter"),
+        hovertemplate="<b>%{x}</b><br>Management: %{y}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=cats, y=eff_vals, name="Effective weight",
+        mode="markers+text",
+        marker=dict(size=14, color=COLORS["navy"], symbol="diamond",
+                    line=dict(color="white", width=2)),
+        text=[f"{v:.1f}" for v in eff_vals],
+        textposition="top center",
+        textfont=dict(color=COLORS["navy"], size=11, family="Inter"),
+        hovertemplate="<b>%{x}</b><br>Effective: %{y:.1f}<extra></extra>",
+    ))
+    fig.update_layout(
+        height=500, barmode="stack",
+        xaxis=dict(title="", gridcolor=COLORS["border"]),
+        yaxis=dict(title="Pilots", gridcolor=COLORS["border"]),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5),
+        margin=dict(l=60, r=30, t=40, b=80),
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 # ---------------------------------------------------------------------------
 # TAB 5 — Action Planner
@@ -895,12 +1147,13 @@ def tab_action_planner():
     action_type = st.selectbox("Action type", ACTION_TYPES, key="new_action_type")
 
     with st.form("add_action", clear_on_submit=False):
-        if action_type == "Type Rating":        _form_type_rating(d)
-        elif action_type == "Command Upgrade":  _form_command_upgrade(d)
-        elif action_type == "Cadet Hire":       _form_hire(d, "Cadet Hire")
-        elif action_type == "Expat Hire":       _form_hire(d, "Expat Hire")
-        elif action_type == "Local Hire":       _form_hire(d, "Local Hire")
-        elif action_type == "Fleet Change":     _form_fleet_change(d)
+        if action_type == "Type Rating":           _form_type_rating(d)
+        elif action_type == "Command Upgrade":     _form_command_upgrade(d)
+        elif action_type == "Cadet Hire":          _form_hire(d, "Cadet Hire")
+        elif action_type == "Expat Hire":          _form_hire(d, "Expat Hire")
+        elif action_type == "Local Hire":          _form_hire(d, "Local Hire")
+        elif action_type == "Fleet Change":        _form_fleet_change(d)
+        elif action_type == "Pilot Termination":   _form_pilot_termination(d)
 
     if d["conflicts"]:
         section_header("Conflicts")
@@ -922,14 +1175,27 @@ def tab_action_planner():
             title += f"  ·  → {a.to_fleet} {a.to_function} ({a.new_pilot_name or 'TBD'})"
         elif a.action_type == "Fleet Change":
             title += f"  ·  {a.from_fleet}"
+        elif a.action_type == "Pilot Termination":
+            n_pilots = len(a.trainee_ids)
+            title += f"  ·  {n_pilots} pilot{'s' if n_pilots != 1 else ''} departing"
 
         with st.expander(title):
             c1, c2 = st.columns([5, 1])
             with c1:
+                trainees_display = []
+                seat_support_display = []
+                for tid in a.trainee_ids:
+                    if tid.startswith("SEAT:"):
+                        seat_support_display.append(tid[5:])
+                    else:
+                        trainees_display.append(tid)
+                trainee_str = ", ".join(trainees_display) if trainees_display else "—"
+                seat_str = ", ".join(seat_support_display) if seat_support_display else ""
                 st.markdown(
                     f"**Duration:** {a.duration}mo  &nbsp; **Mode:** {a.mode}  &nbsp; "
                     f"**Instructor:** {a.instructor_id or '—'}  &nbsp; "
-                    f"**Trainees:** {', '.join(a.trainee_ids) if a.trainee_ids else '—'}"
+                    f"**Trainees:** {trainee_str}"
+                    + (f"  &nbsp; **Seat Support:** {seat_str}" if seat_str else "")
                 )
                 if a.note: st.markdown(f"_{a.note}_")
                 graph = build_cascade_graph(a, ss.pilots, ss.actions)
@@ -952,7 +1218,6 @@ def _month_selector(d, key: str) -> int:
 def _pilot_picker(label, key, fleet_filter=None, function_filter=None,
                   nationality_filter=None, allow_tbd=True, max_selections=None,
                   show_filter_toggle=True) -> list[str]:
-    """Searchable all-pilot picker with optional eligibility-only filter."""
     ss = st.session_state
     pool = list(ss.pilots)
 
@@ -1000,7 +1265,6 @@ def _form_type_rating(d):
     with c3:
         start = _month_selector(d, "tr_start")
 
-    # Duration suggestion — take the worst case across all possible origin/role combos
     suggested = 1
     for origin_fleet in FLEETS:
         for origin_fn in FUNCTIONS:
@@ -1021,7 +1285,6 @@ def _form_type_rating(d):
     )
 
     def _trainee_block(slot: int, required: bool):
-        """Render one trainee slot. Returns (pilot_id, origin_fleet, role) or (None, None, None)."""
         prefix = f"tr_t{slot}"
         header = "**Trainee 1**" if required else "**Trainee 2** (optional)"
         st.markdown(header)
@@ -1039,16 +1302,13 @@ def _form_type_rating(d):
             role = st.selectbox("Role", role_options, key=f"{prefix}_role")
 
         with c2:
-            # Let the user pick the trainee's origin fleet — independent of other trainees
             origin_fleet = st.selectbox(
-                "Origin fleet",
-                FLEETS,
+                "Origin fleet", FLEETS,
                 key=f"{prefix}_origin_fleet",
                 help="The trainee's current fleet before this type rating.",
             )
 
         with c3:
-            # The origin function is implied by the role, so filter the picker accordingly
             if role.startswith("Captain →"):
                 fn_filter = ["Captain"]
             elif role.startswith("First Officer →"):
@@ -1084,7 +1344,6 @@ def _form_type_rating(d):
     note = st.text_input("Note (optional)", key="tr_note")
 
     if st.form_submit_button("Add Type Rating", type="primary"):
-        # Collect candidates
         candidates = []
         if t1_pilot:
             candidates.append((t1_pilot, t1_origin, t1_role))
@@ -1095,7 +1354,6 @@ def _form_type_rating(d):
             st.error("Pick at least one trainee.")
             return
 
-        # Validate function alignment (TBDs skip this check)
         pilot_by_id = {p.employee_id: p for p in ss.pilots}
         for pid, origin, role in candidates:
             if pid.startswith("TBD") or role == "Seat Support":
@@ -1122,12 +1380,8 @@ def _form_type_rating(d):
                 )
                 return
 
-        # Group by (origin_fleet, from_function, to_function) so the engine
-        # handles each sub-group of the cohort correctly. Mixed origins are
-        # common — 1 DHC-8 CPT + 1 ATR CPT both going to A320 FO is two
-        # groups with the same (to_fleet, to_function) = (A320, FO).
         groups: dict[tuple[str, str, str], list[str]] = {}
-        seat_support: list[tuple[str, str]] = []  # (pilot_id, origin_fleet)
+        seat_support: list[tuple[str, str]] = []
 
         for pid, origin, role in candidates:
             if role == "Captain → Captain":
@@ -1147,7 +1401,6 @@ def _form_type_rating(d):
             ss.actions.append(PlannedAction(
                 id=new_id("act"), action_type="Type Rating",
                 start_month=start, duration=duration, mode=mode,
-                # Instructor attached only to the first action in the cohort
                 instructor_id="" if first_emitted else instructor,
                 trainee_ids=list(trainees),
                 from_fleet=origin_fleet, from_function=from_fn,
@@ -1157,8 +1410,6 @@ def _form_type_rating(d):
             first_emitted = True
             added += 1
 
-        # Seat support — attach to an existing cohort action if one exists,
-        # otherwise emit a dedicated action
         if seat_support:
             if first_emitted:
                 for act in reversed(ss.actions):
@@ -1168,8 +1419,6 @@ def _form_type_rating(d):
                         ]
                         break
             else:
-                # If ONLY seat support and all from the same origin, record it;
-                # if mixed origins, create one action per origin fleet
                 by_origin: dict[str, list[str]] = {}
                 for pid, origin in seat_support:
                     by_origin.setdefault(origin, []).append(pid)
@@ -1305,27 +1554,81 @@ def _form_fleet_change(d):
         st.success(f"{action} 1× {fleet} scheduled."); st.rerun()
 
 
+def _form_pilot_termination(d):
+    ss = st.session_state
+
+    st.markdown(
+        "Schedule the departure of one or more pilots. From the termination "
+        "month onward, they no longer contribute to availability on any fleet. "
+        "They remain in the registry so historical actions still reference them "
+        "meaningfully — delete the termination action if you need to bring them back."
+    )
+
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        term_month = _month_selector(d, "term_start")
+    with c2:
+        reason = st.selectbox(
+            "Reason",
+            ["Contract end", "Resignation", "Retirement",
+             "Localisation replacement", "Other"],
+            key="term_reason",
+        )
+
+    st.markdown("**Pilots to terminate** (pick one or more)")
+    pilots = _pilot_picker(
+        "Select pilots", "term_pilots",
+        allow_tbd=False,
+        max_selections=10,
+    )
+
+    note = st.text_input("Note (optional)", key="term_note",
+                         placeholder="Context or replacement plan…")
+
+    if st.form_submit_button("Schedule termination(s)", type="primary"):
+        if not pilots:
+            st.error("Pick at least one pilot.")
+            return
+
+        pilot_by_id = {p.employee_id: p for p in ss.pilots}
+        summary_bits = []
+        for pid in pilots:
+            p = pilot_by_id.get(pid)
+            if p:
+                summary_bits.append(f"{p.full_name} ({p.fleet} {p.function}, {p.nationality})")
+
+        combined_note = f"Reason: {reason}"
+        if note.strip():
+            combined_note += f" — {note.strip()}"
+
+        ss.actions.append(PlannedAction(
+            id=new_id("act"), action_type="Pilot Termination",
+            start_month=term_month, duration=0, mode="—",
+            trainee_ids=list(pilots),
+            note=combined_note,
+        ))
+        st.success(f"Scheduled termination of {len(pilots)} pilot(s): "
+                   f"{', '.join(summary_bits[:3])}"
+                   + (f" and {len(summary_bits) - 3} more" if len(summary_bits) > 3 else ""))
+        st.rerun()
+
+
 def _suggest_duration(action_type, from_fleet, from_func, to_fleet, to_func) -> int:
     if action_type == "Type Rating":
-        # Same-function DHC-8 → ATR
         if from_fleet == "DHC8" and to_fleet == "ATR72" and from_func == to_func:
             return TRAINING_DURATIONS["type_rating_dhc8_to_atr"]
-        # Anything (Cpt or FO) from ATR/DHC8 → A320 FO
         if to_fleet == "A320" and to_func == "First Officer" and from_fleet in ("ATR72", "DHC8"):
             return TRAINING_DURATIONS["type_rating_any_to_a320_fo"]
-        # A320 FO → A330 FO
         if (from_fleet == "A320" and from_func == "First Officer"
                 and to_fleet == "A330" and to_func == "First Officer"):
             return TRAINING_DURATIONS["type_rating_a320_fo_to_a330_fo"]
-        # A320 Captain → A330 First Officer (downgrade route)
         if (from_fleet == "A320" and from_func == "Captain"
                 and to_fleet == "A330" and to_func == "First Officer"):
             return TRAINING_DURATIONS["type_rating_a320_fo_to_a330_fo"]
-        # ATR/DHC8 Captain → A330 First Officer (rare but legitimate)
         if (from_fleet in ("ATR72", "DHC8") and from_func == "Captain"
                 and to_fleet == "A330" and to_func == "First Officer"):
             return TRAINING_DURATIONS["type_rating_any_to_a320_fo"]
-        return 2  # generic fallback
+        return 2
     return 1
 
 
@@ -1407,9 +1710,803 @@ def _render_cascade_plot(graph, key_suffix: str = ""):
     )
     st.plotly_chart(fig, use_container_width=True, key=f"cascade_{key_suffix}")
 
+# ---------------------------------------------------------------------------
+# TAB 6 — Crew Flow Map
+# ---------------------------------------------------------------------------
+def tab_flow_map():
+    ss = st.session_state
+    d = derived()
+
+    section_header("Crew Flow Map")
+    info_panel(
+        "Visualises how pilots move through the fleet network over your planning "
+        "horizon. The <b>Sankey</b> shows who transitions from where to where. "
+        "The <b>coverage bubble chart</b> shows requirement vs availability at a "
+        "glance. The <b>network graph</b> shows the shape of the training pipeline. "
+        "All three are fully interactive — hover, drag, zoom, filter.",
+        kind="info",
+    )
+
+    c1, c2, c3 = st.columns([2, 2, 3])
+    with c1:
+        view = st.selectbox(
+            "Visualisation",
+            ["Sankey — pilot transitions",
+             "Bubble chart — coverage over time",
+             "Network — fleet interconnections"],
+            key="fm_view",
+        )
+    with c2:
+        snapshot_month = st.selectbox(
+            "Snapshot at end of month",
+            options=list(range(ss.horizon)),
+            format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}",
+            index=ss.horizon - 1,
+            key="fm_snapshot",
+        )
+    with c3:
+        st.caption(
+            "Use the snapshot selector to see the state of your plan at any "
+            "point in the horizon. Dragging, zooming, and hover-to-drill all "
+            "work on the visualisations below."
+        )
+
+    if view == "Sankey — pilot transitions":
+        _flow_sankey(d, snapshot_month)
+    elif view == "Bubble chart — coverage over time":
+        _flow_bubble(d)
+    else:
+        _flow_network(d, snapshot_month)
+
+
+def _flow_sankey(d, up_to_month: int):
+    ss = st.session_state
+
+    st.markdown("**Filters**")
+    fc1, fc2, fc3, fc4 = st.columns(4)
+    with fc1:
+        filt_fleets = st.multiselect(
+            "Show flows touching fleets",
+            options=FLEETS, default=FLEETS, key="fm_sk_fleets",
+        )
+    with fc2:
+        filt_funcs = st.multiselect(
+            "Show flows touching functions",
+            options=FUNCTIONS, default=FUNCTIONS, key="fm_sk_funcs",
+        )
+    with fc3:
+        filt_nats = st.multiselect(
+            "Show flows by nationality",
+            options=NATIONALITIES, default=NATIONALITIES, key="fm_sk_nats",
+        )
+    with fc4:
+        show_static = st.checkbox(
+            "Hide non-movers", value=True, key="fm_sk_hide_static",
+        )
+
+    layout_mode = st.radio(
+        "Sankey layout",
+        ["Time-aware (one column per month with activity)",
+         "Classic (start → end only)"],
+        horizontal=True, key="fm_sk_layout",
+    )
+
+    if layout_mode.startswith("Time-aware"):
+        _flow_sankey_time_aware(d, up_to_month,
+                                filt_fleets, filt_funcs, filt_nats, show_static)
+    else:
+        _flow_sankey_classic(d, up_to_month,
+                             filt_fleets, filt_funcs, filt_nats, show_static)
+
+
+def _flow_sankey_classic(d, up_to_month, filt_fleets, filt_funcs, filt_nats, show_static):
+    ss = st.session_state
+
+    combos: list[tuple[str, str, str]] = []
+    for f in FLEETS:
+        for fn in FUNCTIONS:
+            for nat in NATIONALITIES:
+                combos.append((f, fn, nat))
+    N = len(combos)
+    src_idx = {combos[i]: i for i in range(N)}
+    dst_idx = {combos[i]: i + N for i in range(N)}
+    hire_local_idx = 2 * N
+    hire_expat_idx = 2 * N + 1
+
+    def _node_label(combo, suffix):
+        f, fn, nat = combo
+        fn_short = "CPT" if fn == "Captain" else "FO"
+        nat_short = "LOC" if nat == "Local" else "EXP"
+        return f"{f}  {fn_short}  {nat_short}   {suffix}"
+
+    labels = (
+        [_node_label(c, "start") for c in combos]
+        + [_node_label(c, "end  ") for c in combos]
+        + ["New hire — Local", "New hire — Expat"]
+    )
+
+    def _node_color(combo):
+        f, fn, nat = combo
+        alpha = 0.95 if nat == "Local" else 0.60
+        return _fleet_function_color(f, fn, alpha)
+
+    node_colors = (
+        [_node_color(c) for c in combos]
+        + [_node_color(c) for c in combos]
+        + ["rgba(22,163,74,0.85)", "rgba(220,38,38,0.65)"]
+    )
+    node_x = [0.01] * N + [0.99] * N + [0.01, 0.01]
+
+    pilot_by_id = {p.employee_id: p for p in ss.pilots}
+    pilot_dest: dict[str, tuple[str, str, str]] = {
+        p.employee_id: (p.fleet, p.function, p.nationality)
+        for p in ss.pilots if p.fleet in FLEETS
+    }
+    # Track terminated pilots — they drop off at the end
+    terminated: set[str] = set()
+    for a in ss.actions:
+        if a.action_type == "Pilot Termination" and a.start_month <= up_to_month:
+            for tid in a.trainee_ids:
+                if not tid.startswith("TBD"):
+                    terminated.add(tid)
+
+    flows: dict[tuple[int, int], dict] = {}
+
+    def _bump(src, dst, desc):
+        key = (src, dst)
+        if key not in flows:
+            flows[key] = {"value": 0, "desc": []}
+        flows[key]["value"] += 1
+        flows[key]["desc"].append(desc)
+
+    for a in sorted(ss.actions, key=lambda x: x.start_month):
+        end = a.start_month + a.duration
+        if end > up_to_month + 1:
+            continue
+        if a.action_type == "Type Rating":
+            for tid in a.trainee_ids:
+                if tid.startswith("SEAT:") or tid.startswith("TBD"): continue
+                p = pilot_by_id.get(tid)
+                if not p or p.fleet not in FLEETS: continue
+                pilot_dest[tid] = (a.to_fleet, a.to_function, p.nationality)
+        elif a.action_type == "Command Upgrade":
+            for tid in a.trainee_ids:
+                if tid.startswith("SEAT:") or tid.startswith("TBD"): continue
+                p = pilot_by_id.get(tid)
+                if not p or p.fleet not in FLEETS: continue
+                pilot_dest[tid] = (a.to_fleet, "Captain", p.nationality)
+        elif a.action_type in ("Cadet Hire", "Local Hire") and a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
+            target = (a.to_fleet, a.to_function, "Local")
+            if a.to_fleet in filt_fleets and a.to_function in filt_funcs and "Local" in filt_nats:
+                _bump(hire_local_idx, dst_idx[target], f"Hire: {a.new_pilot_name or 'TBD'}")
+        elif a.action_type == "Expat Hire" and a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
+            target = (a.to_fleet, a.to_function, "Expat")
+            if a.to_fleet in filt_fleets and a.to_function in filt_funcs and "Expat" in filt_nats:
+                _bump(hire_expat_idx, dst_idx[target], f"Hire: {a.new_pilot_name or 'TBD'}")
+
+    for pid, dest in pilot_dest.items():
+        if pid in terminated: continue
+        p = pilot_by_id.get(pid)
+        if not p or p.fleet not in FLEETS: continue
+        src_combo = (p.fleet, p.function, p.nationality)
+        if show_static and src_combo == dest: continue
+        if not (src_combo[0] in filt_fleets or dest[0] in filt_fleets): continue
+        if not (src_combo[1] in filt_funcs or dest[1] in filt_funcs): continue
+        if p.nationality not in filt_nats: continue
+        if src_combo not in src_idx or dest not in dst_idx: continue
+        _bump(src_idx[src_combo], dst_idx[dest], f"{p.employee_id} — {p.full_name}")
+
+    if not flows:
+        info_panel("No flows match the current filters.")
+        return
+
+    _render_sankey_figure(labels, node_colors, node_x, flows, height=720)
+
+
+def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, show_static):
+    ss = st.session_state
+    labels_months = d["labels"][: up_to_month + 1]
+    if not labels_months:
+        info_panel("No months to display."); return
+
+    activity_months: set[int] = {0, up_to_month}
+    for a in ss.actions:
+        if a.start_month <= up_to_month:
+            activity_months.add(a.start_month)
+        end = a.start_month + a.duration
+        if end <= up_to_month:
+            activity_months.add(end)
+    activity_months = sorted(m for m in activity_months if 0 <= m <= up_to_month)
+
+    MAX_COLUMNS = 6
+    if len(activity_months) > MAX_COLUMNS:
+        step = len(activity_months) / MAX_COLUMNS
+        sampled = [activity_months[int(i * step)] for i in range(MAX_COLUMNS)]
+        if activity_months[-1] not in sampled:
+            sampled[-1] = activity_months[-1]
+        activity_months = sampled
+        info_panel(
+            f"Showing {MAX_COLUMNS} time columns (sampled). Narrow your snapshot "
+            "month on the left to zoom in on fewer transitions.",
+            kind="info",
+        )
+
+    pilot_by_id = {p.employee_id: p for p in ss.pilots}
+
+    # Termination cutoff per pilot
+    terminated_at: dict[str, int] = {}
+    for a in ss.actions:
+        if a.action_type == "Pilot Termination":
+            for tid in a.trainee_ids:
+                if not tid.startswith("TBD"):
+                    if tid not in terminated_at or a.start_month < terminated_at[tid]:
+                        terminated_at[tid] = a.start_month
+
+    def position_at(pid, month_idx) -> tuple[str, str, str] | None:
+        if pid in terminated_at and month_idx >= terminated_at[pid]:
+            return None
+        p = pilot_by_id.get(pid)
+        if not p or p.fleet not in FLEETS:
+            return None
+        current = (p.fleet, p.function, p.nationality)
+        for a in sorted(ss.actions, key=lambda x: x.start_month):
+            end = a.start_month + a.duration
+            if end > month_idx: continue
+            if pid in a.trainee_ids and not any(
+                t == f"SEAT:{pid}" for t in a.trainee_ids
+            ):
+                if a.action_type == "Type Rating":
+                    current = (a.to_fleet, a.to_function, current[2])
+                elif a.action_type == "Command Upgrade":
+                    current = (a.to_fleet, "Captain", current[2])
+        return current
+
+    virtual_hires: list[tuple[int, PlannedAction]] = []
+    for a in ss.actions:
+        if a.action_type in ("Cadet Hire", "Local Hire", "Expat Hire"):
+            end = a.start_month + a.duration
+            if end <= up_to_month:
+                virtual_hires.append((end, a))
+
+    node_ids: list[str] = []
+    node_labels: list[str] = []
+    node_colors: list[str] = []
+    node_x: list[float] = []
+    node_map: dict[tuple[int, str, str, str], int] = {}
+    hire_node_map: dict[tuple[int, str], int] = {}
+
+    def ensure_node(month, combo):
+        key = (month, *combo)
+        if key in node_map:
+            return node_map[key]
+        idx = len(node_ids)
+        node_map[key] = idx
+        f, fn, nat = combo
+        fn_short = "CPT" if fn == "Captain" else "FO"
+        nat_short = "LOC" if nat == "Local" else "EXP"
+        node_ids.append(f"m{month}_{f}_{fn}_{nat}")
+        node_labels.append(f"{f} {fn_short} {nat_short}")
+        alpha = 0.95 if nat == "Local" else 0.60
+        node_colors.append(_fleet_function_color(f, fn, alpha))
+        col_pos = activity_months.index(month) / max(1, len(activity_months) - 1)
+        node_x.append(0.02 + 0.96 * col_pos)
+        return idx
+
+    def ensure_hire_node(month, nat):
+        key = (month, nat)
+        if key in hire_node_map:
+            return hire_node_map[key]
+        idx = len(node_ids)
+        hire_node_map[key] = idx
+        node_ids.append(f"m{month}_hire_{nat}")
+        node_labels.append(f"+ Hire ({nat[:3]})")
+        node_colors.append(
+            "rgba(22,163,74,0.85)" if nat == "Local" else "rgba(220,38,38,0.65)"
+        )
+        col_pos = activity_months.index(month) / max(1, len(activity_months) - 1)
+        node_x.append(0.02 + 0.96 * col_pos)
+        return idx
+
+    flows: dict[tuple[int, int], dict] = {}
+    def _bump(src, dst, desc):
+        key = (src, dst)
+        if key not in flows: flows[key] = {"value": 0, "desc": []}
+        flows[key]["value"] += 1
+        flows[key]["desc"].append(desc)
+
+    snapshots: dict[int, dict[str, tuple[str, str, str]]] = {}
+    for m in activity_months:
+        snap: dict[str, tuple[str, str, str]] = {}
+        for p in ss.pilots:
+            pos = position_at(p.employee_id, m)
+            if pos: snap[p.employee_id] = pos
+        for end, a in virtual_hires:
+            if end <= m:
+                virt_id = f"_virtual_{a.id}"
+                nat = "Local" if a.action_type in ("Cadet Hire", "Local Hire") else "Expat"
+                snap[virt_id] = (a.to_fleet, a.to_function, nat)
+        snapshots[m] = snap
+
+    for i in range(len(activity_months) - 1):
+        m0, m1 = activity_months[i], activity_months[i + 1]
+        snap0, snap1 = snapshots[m0], snapshots[m1]
+
+        for pid, pos0 in snap0.items():
+            if pos0[0] not in filt_fleets: continue
+            if pos0[1] not in filt_funcs: continue
+            if pos0[2] not in filt_nats: continue
+            pos1 = snap1.get(pid)
+            if pos1 is None: continue
+            if show_static and pos0 == pos1: continue
+            src = ensure_node(m0, pos0)
+            dst = ensure_node(m1, pos1)
+            p = pilot_by_id.get(pid)
+            name = p.full_name if p else pid
+            _bump(src, dst, f"{pid} — {name}")
+
+        for end, a in virtual_hires:
+            if m0 < end <= m1:
+                nat = "Local" if a.action_type in ("Cadet Hire", "Local Hire") else "Expat"
+                if a.to_fleet not in filt_fleets: continue
+                if a.to_function not in filt_funcs: continue
+                if nat not in filt_nats: continue
+                src = ensure_hire_node(m1, nat)
+                dst = ensure_node(m1, (a.to_fleet, a.to_function, nat))
+                _bump(src, dst, f"Hire: {a.new_pilot_name or 'TBD'}")
+
+    if not flows:
+        info_panel(
+            "No flows match the current filters. Widen filters or untick "
+            "<b>Hide non-movers</b> to see pilots who stay in place."
+        )
+        return
+
+    _render_sankey_figure(
+        node_labels, node_colors, node_x, flows,
+        height=760,
+        column_labels=[d["labels"][m] for m in activity_months],
+        column_positions=[0.02 + 0.96 * (i / max(1, len(activity_months) - 1))
+                          for i in range(len(activity_months))],
+    )
+
+
+def _render_sankey_figure(
+    labels, node_colors, node_x, flows,
+    height=720, column_labels=None, column_positions=None,
+):
+    sources = [k[0] for k in flows.keys()]
+    targets = [k[1] for k in flows.keys()]
+    values = [v["value"] for v in flows.values()]
+
+    hovers = []
+    for k, v in flows.items():
+        s_lbl = labels[k[0]].strip()
+        t_lbl = labels[k[1]].strip()
+        desc = v["desc"][:10]
+        more = f"<br>…and {len(v['desc']) - 10} more" if len(v["desc"]) > 10 else ""
+        hovers.append(
+            f"<b>{s_lbl}</b><br>↓<br><b>{t_lbl}</b><br>"
+            f"<b>Count: {v['value']}</b><br><br>"
+            + "<br>".join(desc) + more
+        )
+
+    def _link_color(src_i):
+        c = node_colors[src_i]
+        if c.startswith("rgba"):
+            parts = c[5:-1].split(",")
+            return f"rgba({parts[0]},{parts[1]},{parts[2]},0.45)"
+        return c
+    link_colors = [_link_color(s) for s in sources]
+
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=22, thickness=18,
+            line=dict(color="white", width=1.5),
+            label=labels, color=node_colors, x=node_x,
+            hovertemplate="<b>%{label}</b><br>Total: %{value} pilots<extra></extra>",
+        ),
+        link=dict(
+            source=sources, target=targets, value=values,
+            color=link_colors, customdata=hovers,
+            hovertemplate="%{customdata}<extra></extra>",
+            line=dict(color="rgba(255,255,255,0.2)", width=0.3),
+        ),
+        textfont=dict(family="Inter, sans-serif", size=12, color=COLORS["navy"]),
+    ))
+
+    annotations = []
+    if column_labels and column_positions:
+        for lbl, xp in zip(column_labels, column_positions):
+            annotations.append(dict(
+                x=xp, y=1.06, xref="paper", yref="paper",
+                text=f"<b>{lbl}</b>", showarrow=False,
+                font=dict(size=12, color=COLORS["accent"], family="Inter, sans-serif"),
+                align="center",
+            ))
+
+    fig.update_layout(
+        height=height,
+        margin=dict(l=10, r=10, t=60 if annotations else 30, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, sans-serif", size=12, color=COLORS["navy"]),
+        annotations=annotations,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown(
+        f"""
+        <div style="background:{COLORS['surface']}; border:1px solid {COLORS['border']};
+             border-radius:10px; padding:12px 16px; margin-top:8px; font-size:12px;">
+            <b>How to read this:</b> each node is
+            <i>Fleet · Function · Nationality</i>. Band thickness = pilot count.
+            Band colour keys on the <i>source</i> fleet — follow a colour to trace
+            one fleet's outflow. Hover any band for the exact pilot list.
+            {"The bold labels above each column mark the time point of that snapshot." if column_labels else ""}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    section_header("Flow summary")
+    rows = []
+    for k, v in sorted(flows.items(), key=lambda kv: -kv[1]["value"]):
+        rows.append({
+            "From": labels[k[0]].strip(),
+            "To": labels[k[1]].strip(),
+            "Pilots": v["value"],
+            "First few": ", ".join(v["desc"][:3]) + ("…" if len(v["desc"]) > 3 else ""),
+        })
+    if rows:
+        st.dataframe(_safe_df(rows), hide_index=True, height=300, width="stretch")
+
+
+def _flow_bubble(d):
+    ss = st.session_state
+
+    fleet_fn_pairs = [(f, fn) for f in FLEETS for fn in FUNCTIONS]
+    pilot_snapshots: dict[int, list] = {m: list(ss.pilots) for m in range(ss.horizon)}
+
+    # Apply terminations and arrivals
+    terminated_at: dict[str, int] = {}
+    for a in ss.actions:
+        if a.action_type == "Pilot Termination":
+            for tid in a.trainee_ids:
+                if not tid.startswith("TBD"):
+                    terminated_at[tid] = a.start_month
+
+    for m in range(ss.horizon):
+        # Remove terminated pilots from month onward
+        pilot_snapshots[m] = [
+            p for p in pilot_snapshots[m]
+            if not (p.employee_id in terminated_at and m >= terminated_at[p.employee_id])
+        ]
+        # Add virtual hires
+        for a in ss.actions:
+            end = a.start_month + a.duration
+            if end <= m and a.action_type in ("Cadet Hire", "Local Hire", "Expat Hire"):
+                nat = "Local" if a.action_type in ("Cadet Hire", "Local Hire") else "Expat"
+                pilot_snapshots[m].append(Pilot(
+                    employee_id=f"_virtual_{a.id}", full_name=a.new_pilot_name or "TBD",
+                    nationality=nat, fleet=a.to_fleet, function=a.to_function,
+                    designations=[], management=False, status="Active",
+                ))
+
+    rows = []
+    for m in range(ss.horizon):
+        snap = pilot_snapshots[m]
+        for f, fn in fleet_fn_pairs:
+            group = [p for p in snap if p.fleet == f and p.function == fn]
+            if not group: continue
+            total = len(group)
+            local = sum(1 for p in group if p.nationality == "Local")
+            local_pct = (local / total * 100) if total else 0
+            req = d["req"][f][fn][m]
+            av = d["avail"][f][fn][m]
+            gap = max(0.0, req - av)
+            rows.append({
+                "month_idx": m, "month": d["labels"][m],
+                "fleet_fn": f"{f} {fn[:3]}",
+                "fleet": f, "function": fn,
+                "local_pct": local_pct,
+                "total": total, "req": req, "av": av, "gap": gap,
+                "band": gap_band(gap),
+            })
+
+    if not rows:
+        info_panel("No data to display."); return
+
+    df = pd.DataFrame(rows)
+    band_color = {"green": COLORS["green"], "amber": COLORS["amber"], "red": COLORS["red"]}
+
+    y_max = max(df["av"].max(), df["req"].max()) * 1.15
+    y_max = max(y_max, 10)
+
+    frames = []
+    for m in range(ss.horizon):
+        sub = df[df.month_idx == m]
+        if sub.empty: continue
+        traces = [
+            go.Scatter(
+                x=sub["local_pct"], y=sub["req"],
+                mode="markers",
+                marker=dict(symbol="line-ew", size=30,
+                            line=dict(color=COLORS["text_muted"], width=2)),
+                hoverinfo="skip", showlegend=False,
+            ),
+            go.Scatter(
+                x=sub["local_pct"], y=sub["av"],
+                mode="markers+text",
+                marker=dict(
+                    size=sub["total"] * 2.5 + 18,
+                    color=[band_color[b] for b in sub["band"]],
+                    line=dict(color=COLORS["navy"], width=1.8),
+                    opacity=0.88, sizemode="diameter",
+                ),
+                text=sub["fleet_fn"], textposition="middle center",
+                textfont=dict(size=10, color="white", family="Inter"),
+                customdata=sub[["fleet_fn", "total", "req", "av", "gap",
+                                "local_pct", "month", "band"]].values,
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>Month: %{customdata[6]}<br>"
+                    "Pilots: %{customdata[1]}<br>Required: %{customdata[2]}<br>"
+                    "Available: %{customdata[3]:.1f}<br>"
+                    "Gap: %{customdata[4]:.1f} (%{customdata[7]})<br>"
+                    "Local: %{customdata[5]:.0f}%<extra></extra>"
+                ),
+                showlegend=False,
+            ),
+        ]
+        frames.append(go.Frame(name=d["labels"][m], data=traces))
+
+    if not frames:
+        info_panel("No data to display."); return
+
+    fig = go.Figure(data=frames[0].data)
+    fig.frames = frames
+
+    steps = []
+    for fr in frames:
+        steps.append(dict(
+            method="animate", label=fr.name,
+            args=[[fr.name], dict(mode="immediate",
+                                  frame=dict(duration=0, redraw=True),
+                                  transition=dict(duration=300))],
+        ))
+
+    fig.update_layout(
+        height=640,
+        xaxis=dict(
+            title=dict(text="Localisation %", font=dict(size=13)),
+            range=[-3, 105], showgrid=True, gridcolor=COLORS["border"], zeroline=False,
+        ),
+        yaxis=dict(
+            title=dict(text="Available pilots (dash = required)", font=dict(size=13)),
+            range=[0, y_max], showgrid=True, gridcolor=COLORS["border"],
+        ),
+        shapes=[
+            dict(type="rect", xref="x", yref="paper",
+                 x0=0, x1=50, y0=0, y1=1,
+                 fillcolor="rgba(220,38,38,0.035)",
+                 line=dict(width=0), layer="below"),
+            dict(type="rect", xref="x", yref="paper",
+                 x0=50, x1=80, y0=0, y1=1,
+                 fillcolor="rgba(217,119,6,0.035)",
+                 line=dict(width=0), layer="below"),
+            dict(type="rect", xref="x", yref="paper",
+                 x0=80, x1=100, y0=0, y1=1,
+                 fillcolor="rgba(22,163,74,0.04)",
+                 line=dict(width=0), layer="below"),
+        ],
+        annotations=[
+            dict(x=25, y=1.02, xref="x", yref="paper", text="Low localisation",
+                 showarrow=False, font=dict(size=10, color=COLORS["red"])),
+            dict(x=65, y=1.02, xref="x", yref="paper", text="Partial",
+                 showarrow=False, font=dict(size=10, color=COLORS["amber"])),
+            dict(x=90, y=1.02, xref="x", yref="paper", text="High localisation",
+                 showarrow=False, font=dict(size=10, color=COLORS["green"])),
+        ],
+        margin=dict(l=70, r=30, t=50, b=100),
+        sliders=[dict(
+            active=0,
+            currentvalue=dict(prefix="Month: ", font=dict(size=13, color=COLORS["navy"])),
+            pad=dict(t=40), steps=steps,
+            bgcolor=COLORS["surface"], bordercolor=COLORS["border"],
+            tickcolor=COLORS["accent"],
+        )],
+        updatemenus=[dict(
+            type="buttons", showactive=False,
+            x=0.02, y=-0.12, xanchor="left", yanchor="top",
+            bgcolor=COLORS["surface"], bordercolor=COLORS["border"],
+            buttons=[
+                dict(label="▶ Play", method="animate",
+                     args=[None, dict(frame=dict(duration=500, redraw=True),
+                                      fromcurrent=True,
+                                      transition=dict(duration=250))]),
+                dict(label="⏸ Pause", method="animate",
+                     args=[[None], dict(frame=dict(duration=0, redraw=False),
+                                        mode="immediate")]),
+            ],
+        )],
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown(
+        f"""
+        <div style="background:{COLORS['surface']}; border:1px solid {COLORS['border']};
+             border-radius:10px; padding:12px 16px; margin-top:8px; font-size:12px;">
+            <b>How to read this:</b> each bubble is a fleet × function.
+            <b>X-axis</b> = localisation percentage.
+            <b>Y-axis</b> = available pilots (the horizontal dash above each bubble
+            marks the requirement — the gap between dash and bubble is the shortfall).
+            <b>Size</b> = total pilots. <b>Colour</b> = gap severity.
+            Drag the slider or hit <b>▶ Play</b> to watch the plan unfold.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _flow_network(d, up_to_month: int):
+    ss = st.session_state
+
+    nodes = []
+    node_idx: dict[tuple[str, str], int] = {}
+    for i, f in enumerate(FLEETS):
+        for fn in FUNCTIONS:
+            node_idx[(f, fn)] = len(nodes)
+            angle = 2 * math.pi * i / len(FLEETS) - math.pi / 2
+            radius = 1.0 if fn == "Captain" else 0.58
+            req = d["req"][f][fn][up_to_month]
+            av = d["avail"][f][fn][up_to_month]
+            gap = max(0, req - av)
+            nodes.append({
+                "x": radius * math.cos(angle),
+                "y": radius * math.sin(angle),
+                "label_fleet": f,
+                "label_fn": "Captain" if fn == "Captain" else "First Officer",
+                "fleet": f, "function": fn,
+                "size": max(22, av * 2.2 + 18),
+                "req": req, "av": av, "gap": gap,
+                "band": gap_band(gap),
+            })
+
+    edge_counts: dict[tuple[int, int], int] = {}
+    edge_actions: dict[tuple[int, int], list[str]] = {}
+    for a in ss.actions:
+        if a.start_month + a.duration > up_to_month + 1: continue
+        if a.action_type == "Type Rating":
+            if (a.from_fleet, a.from_function) in node_idx and (a.to_fleet, a.to_function) in node_idx:
+                key = (node_idx[(a.from_fleet, a.from_function)],
+                       node_idx[(a.to_fleet, a.to_function)])
+                count = sum(1 for t in a.trainee_ids if not t.startswith("SEAT:"))
+                edge_counts[key] = edge_counts.get(key, 0) + count
+                edge_actions.setdefault(key, []).append(
+                    f"TR {a.from_fleet} {a.from_function[:3]} → "
+                    f"{a.to_fleet} {a.to_function[:3]} at {d['labels'][a.start_month]}"
+                )
+        elif a.action_type == "Command Upgrade":
+            if (a.from_fleet, "First Officer") in node_idx and (a.to_fleet, "Captain") in node_idx:
+                key = (node_idx[(a.from_fleet, "First Officer")],
+                       node_idx[(a.to_fleet, "Captain")])
+                count = sum(1 for t in a.trainee_ids if not t.startswith("SEAT:"))
+                edge_counts[key] = edge_counts.get(key, 0) + count
+                edge_actions.setdefault(key, []).append(
+                    f"CU {a.from_fleet} → {a.to_fleet} CPT at {d['labels'][a.start_month]}"
+                )
+
+    fig = go.Figure()
+
+    # Ring guides
+    for r, lbl in [(1.0, "Captains"), (0.58, "First Officers")]:
+        theta = [i * 2 * math.pi / 60 for i in range(61)]
+        fig.add_trace(go.Scatter(
+            x=[r * math.cos(t) for t in theta],
+            y=[r * math.sin(t) for t in theta],
+            mode="lines",
+            line=dict(color=COLORS["border"], width=1, dash="dot"),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_annotation(
+            x=0, y=r + 0.08, text=lbl, showarrow=False,
+            font=dict(size=10, color=COLORS["text_muted"]),
+        )
+
+    # Edges as bezier curves
+    for (src, tgt), count in edge_counts.items():
+        x0, y0 = nodes[src]["x"], nodes[src]["y"]
+        x1, y1 = nodes[tgt]["x"], nodes[tgt]["y"]
+        mx = (x0 + x1) / 2 + (y1 - y0) * 0.22
+        my = (y0 + y1) / 2 - (x1 - x0) * 0.22
+        pts = []
+        for i in range(21):
+            t = i / 20
+            bx = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * mx + t ** 2 * x1
+            by = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * my + t ** 2 * y1
+            pts.append((bx, by))
+        fig.add_trace(go.Scatter(
+            x=[p[0] for p in pts], y=[p[1] for p in pts],
+            mode="lines",
+            line=dict(color=COLORS["accent"], width=min(14, 3 + count * 1.6)),
+            opacity=0.55, hoverinfo="skip", showlegend=False,
+        ))
+        ax, ay = pts[18]
+        fig.add_trace(go.Scatter(
+            x=[ax], y=[ay], mode="markers",
+            marker=dict(symbol="triangle-right", size=14, color=COLORS["accent"]),
+            hoverinfo="skip", showlegend=False,
+        ))
+        fig.add_trace(go.Scatter(
+            x=[mx], y=[my], mode="markers+text",
+            marker=dict(size=22, color="white",
+                        line=dict(color=COLORS["accent"], width=2)),
+            text=[f"<b>{count}</b>"],
+            textfont=dict(size=11, color=COLORS["navy"]),
+            hovertext="<br>".join(edge_actions[(src, tgt)]),
+            hoverinfo="text", showlegend=False,
+        ))
+
+    band_ring = {"green": COLORS["green"], "amber": COLORS["amber"], "red": COLORS["red"]}
+    for n in nodes:
+        fig.add_trace(go.Scatter(
+            x=[n["x"]], y=[n["y"]], mode="markers",
+            marker=dict(size=n["size"] + 12, color=band_ring[n["band"]],
+                        opacity=0.25, line=dict(width=0)),
+            hoverinfo="skip", showlegend=False,
+        ))
+        col = _fleet_function_color(n["fleet"], n["function"])
+        fig.add_trace(go.Scatter(
+            x=[n["x"]], y=[n["y"]], mode="markers",
+            marker=dict(size=n["size"], color=col,
+                        line=dict(color="white", width=2.5)),
+            hovertext=(
+                f"<b>{n['label_fleet']} {n['label_fn']}</b><br>"
+                f"Required: {n['req']}<br>Available: {n['av']:.1f}<br>"
+                f"Gap: {n['gap']:.1f} ({n['band']})"
+            ),
+            hoverinfo="text", showlegend=False,
+        ))
+        fig.add_annotation(
+            x=n["x"], y=n["y"],
+            text=f"<b>{n['label_fleet']}</b><br>"
+                 f"<span style='font-size:9px'>{'CPT' if n['function'] == 'Captain' else 'FO'}</span>",
+            showarrow=False,
+            font=dict(size=11, color="white", family="Inter"),
+            align="center",
+        )
+
+    fig.update_layout(
+        height=680,
+        xaxis=dict(visible=False, range=[-1.4, 1.4]),
+        yaxis=dict(visible=False, range=[-1.35, 1.35],
+                   scaleanchor="x", scaleratio=1),
+        margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown(
+        f"""
+        <div style="background:{COLORS['surface']}; border:1px solid {COLORS['border']};
+             border-radius:10px; padding:12px 16px; margin-top:8px; font-size:12px;
+             display:flex; gap:28px; flex-wrap:wrap; align-items:center;">
+            <b>Legend:</b>
+            <span>⬤ Outer ring = <b>Captains</b></span>
+            <span>⬤ Inner ring = <b>First Officers</b></span>
+            <span style="color:{COLORS['green']}">●</span> Gap met
+            <span style="color:{COLORS['amber']}">●</span> 1 short
+            <span style="color:{COLORS['red']}">●</span> 2+ short
+            <span>Edge thickness = pilot count crossing that route.</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ---------------------------------------------------------------------------
-# TAB 6 — Localisation
+# TAB 7 — Localisation
 # ---------------------------------------------------------------------------
 def tab_localisation():
     ss = st.session_state
@@ -1421,7 +2518,7 @@ def tab_localisation():
     with c1: metric_card("Overall local %", f"{loc['local_pct']:.1f}%")
     with c2: metric_card("Local pilots", loc["local"])
     with c3: metric_card("Expat pilots", loc["expat"])
-    with c4: metric_card("Expats w/ feeder", _expats_with_feeder(ss.pilots))
+    with c4: metric_card("Expats w/ feeder", _expats_with_feeder(ss.pilots, ss.actions))
 
     section_header("Per-fleet local share")
     for f in FLEETS:
@@ -1442,7 +2539,7 @@ def tab_localisation():
     else:
         rows = []
         for ex in expats:
-            cands = eligible_feeders_for(ex, ss.pilots)
+            cands = eligible_feeders_for(ex, ss.pilots, ss.actions)
             best = cands[0] if cands else None
             rows.append({
                 "Expat ID": ex.employee_id,
@@ -1458,7 +2555,7 @@ def tab_localisation():
         st.dataframe(_safe_df(rows), hide_index=True, height=360, width="stretch")
 
     section_header("Recommended next actions")
-    recs = _recommended_localisation_actions(ss.pilots)
+    recs = _recommended_localisation_actions(ss.pilots, ss.actions)
     if not recs:
         info_panel("No recommendations.")
     else:
@@ -1468,16 +2565,16 @@ def tab_localisation():
                        f"in <b>{r['months']} months</b>.", kind="info")
 
 
-def _expats_with_feeder(pilots) -> int:
+def _expats_with_feeder(pilots, actions=None) -> int:
     return sum(1 for p in pilots
-               if p.nationality == "Expat" and eligible_feeders_for(p, pilots))
+               if p.nationality == "Expat" and eligible_feeders_for(p, pilots, actions))
 
 
-def _recommended_localisation_actions(pilots) -> list[dict]:
+def _recommended_localisation_actions(pilots, actions=None) -> list[dict]:
     recs, used = [], set()
     for ex in pilots:
         if ex.nationality != "Expat": continue
-        for c in eligible_feeders_for(ex, pilots):
+        for c in eligible_feeders_for(ex, pilots, actions):
             if c["pilot_id"] in used: continue
             recs.append({"expat": ex.full_name,
                          "position": f"{ex.fleet} {ex.function}",
@@ -1494,7 +2591,20 @@ def _render_localisation_projection(d):
     ss = st.session_state
     local, total = d["loc"]["local"], d["loc"]["total"]
     pct_series = []
+
+    # Build termination lookup for nationality-aware removal
+    terminated_nat: list[tuple[int, str]] = []
+    pilot_by_id = {p.employee_id: p for p in ss.pilots}
+    for a in ss.actions:
+        if a.action_type == "Pilot Termination":
+            for tid in a.trainee_ids:
+                if tid.startswith("TBD"): continue
+                p = pilot_by_id.get(tid)
+                if p:
+                    terminated_nat.append((a.start_month, p.nationality))
+
     for m in range(ss.horizon):
+        # Apply arrivals this month
         for a in ss.actions:
             end = a.start_month + a.duration
             if end == m:
@@ -1502,6 +2612,11 @@ def _render_localisation_projection(d):
                     local += 1; total += 1
                 elif a.action_type == "Expat Hire":
                     total += 1
+        # Apply terminations this month
+        for tm, nat in terminated_nat:
+            if tm == m:
+                if nat == "Local": local = max(0, local - 1)
+                total = max(0, total - 1)
         pct_series.append((local / total * 100) if total else 0.0)
 
     fig = go.Figure()
@@ -1519,7 +2634,7 @@ def _render_localisation_projection(d):
 
 
 # ---------------------------------------------------------------------------
-# TAB 7 — AI Optimiser (refresh-aware)
+# TAB 8 — AI Optimiser
 # ---------------------------------------------------------------------------
 def _state_fingerprint() -> str:
     from dataclasses import asdict as _asdict
@@ -1560,19 +2675,31 @@ def _build_optimiser_prompt(state, derived_data, objectives, extra_notes) -> str
     buf.write(
         "Crew set ratios (1 crew set = 1 Captain + 1 First Officer):\n"
         "  A330: 7 per aircraft | A320: 5 | ATR72: 6 | DHC-8: 5\n\n"
-        "Management Pilot contribution: 0.5 (regular = 1.0). Training/Leave = 0.0.\n\n"
+        "Management Pilot contribution: 0.5 (regular = 1.0). Training/Leave = 0.0.\n"
+        "Terminated pilots contribute 0.0 from their termination month onward.\n\n"
         "Training durations (months):\n"
         "  DHC-8 Cpt -> ATR Cpt: 2 | DHC-8 FO -> ATR FO: 2\n"
         "  ATR/DHC-8 any -> A320 FO: 2 | A320 FO -> A330 FO: 1\n"
+        "  A320 CPT -> A330 FO (downgrade route): 1\n"
+        "  ATR/DHC-8 CPT -> A330 FO: 2\n"
         "  Same-fleet Command Upgrade: 1 | A330 FO -> A320 CPT: 2 (compound)\n"
         "  Cadet -> ATR FO: 2 (training lag)\n\n"
         "Command Upgrade eligibility:\n"
         "  A330 CPT: A330 FOs or A320 CPTs\n"
         "  A320 CPT: A320 FOs or A330 FOs (A330 FO path = compound 2mo)\n"
         "  ATR/DHC-8 CPT: same-fleet FOs only\n\n"
+        "Type Rating cohorts can include mixed origin fleets and mixed roles:\n"
+        "  - A single cohort may have, e.g., 1 DHC-8 CPT going to A320 FO AND\n"
+        "    1 ATR CPT going to A320 FO in the same course.\n"
+        "  - Each trainee's role can be Captain→Captain, Captain→FO (downgrade),\n"
+        "    First Officer→First Officer, or Seat Support (off line ops but\n"
+        "    does NOT change fleet/function).\n\n"
         "Internal mode: destination-fleet CPT as instructor AND off-line. Up to 2 trainees.\n"
         "External mode: up to 2 trainees, no instructor consumed.\n\n"
         "Cadets: ATR FO only. 2-month type rating.\n\n"
+        "Pilot Termination: removes a pilot from availability starting the\n"
+        "  termination month. Use for contract ends, resignations, retirements,\n"
+        "  or localisation-driven departures.\n\n"
         "Gap bands: <1 green, 1-2 amber, 2+ red.\n\n"
     )
 
@@ -1583,8 +2710,8 @@ def _build_optimiser_prompt(state, derived_data, objectives, extra_notes) -> str
     if objectives["phase_out_dhc8"]:          obj_lines.append("- Phase out DHC-8 fleet into ATR72 / A320 FO.")
     if objectives["minimise_external_cost"]:  obj_lines.append("- Prefer Internal training over External where feasible.")
     if objectives["avoid_conflicts"]:         obj_lines.append("- No named pilot on two overlapping actions.")
-    if objectives["stagger_trainings"]:       obj_lines.append(
-        f"- Max {objectives['max_concurrent_per_fleet']} concurrent trainings per fleet.")
+    if objectives["stagger_trainings"]:
+        obj_lines.append(f"- Max {objectives['max_concurrent_per_fleet']} concurrent trainings per fleet.")
     buf.write("\n".join(obj_lines) + "\n\n")
 
     buf.write("=" * 70 + "\nCURRENT STATE\n" + "=" * 70 + "\n\n")
@@ -1652,14 +2779,15 @@ def _build_optimiser_prompt(state, derived_data, objectives, extra_notes) -> str
     buf.write(
         "Return your plan as a numbered list of actions. For EACH action:\n\n"
         "Action N:\n"
-        "  Type: <Type Rating | Command Upgrade | Cadet Hire | Expat Hire | Local Hire>\n"
+        "  Type: <Type Rating | Command Upgrade | Cadet Hire | Expat Hire | "
+        "Local Hire | Pilot Termination | Fleet Change>\n"
         "  Start month: <YYYY-MMM>\n"
         "  Duration: <months>\n"
         "  Mode: <Internal | External | —>\n"
         "  From: <fleet> <function>\n"
         "  To: <fleet> <function>\n"
         "  Instructor: <Employee ID or TBD>\n"
-        "  Trainees: <Employee IDs or TBD-1/TBD-2>\n"
+        "  Trainees: <Employee IDs or TBD-1/TBD-2; use SEAT:<id> for seat-support pilots>\n"
         "  Rationale: <one line>\n\n"
         "After the list: (1) post-plan requirement-vs-availability summary, "
         "(2) risk assessment, (3) assumptions.\n"
@@ -1762,7 +2890,7 @@ def tab_ai_optimiser():
 
 
 # ---------------------------------------------------------------------------
-# TAB 8 — Print Plan
+# TAB 9 — Print Plan
 # ---------------------------------------------------------------------------
 def tab_print_plan():
     ss = st.session_state
@@ -1784,13 +2912,25 @@ def tab_print_plan():
     section_header("Action summary")
     if ss.actions:
         rows = []
+        pilot_by_id = {p.employee_id: p for p in ss.pilots}
         for a in sorted(ss.actions, key=lambda x: x.start_month):
             mo = d["labels"][a.start_month] if 0 <= a.start_month < len(d["labels"]) else f"M{a.start_month}"
+            # For Pilot Termination, show first few pilot names
+            if a.action_type == "Pilot Termination":
+                names = []
+                for tid in a.trainee_ids[:2]:
+                    p = pilot_by_id.get(tid)
+                    names.append(p.full_name if p else tid)
+                from_display = ", ".join(names) + (f" +{len(a.trainee_ids) - 2}" if len(a.trainee_ids) > 2 else "")
+                to_display = "—"
+            else:
+                from_display = f"{a.from_fleet} {a.from_function}".strip()
+                to_display = f"{a.to_fleet} {a.to_function}".strip()
+
             rows.append({
                 "Month": mo, "Type": a.action_type,
-                "From": f"{a.from_fleet} {a.from_function}".strip(),
-                "To": f"{a.to_fleet} {a.to_function}".strip(),
-                "Mode": a.mode, "Duration": f"{a.duration}mo",
+                "From": from_display, "To": to_display,
+                "Mode": a.mode, "Duration": f"{a.duration}mo" if a.duration else "—",
             })
         st.dataframe(_safe_df(rows), hide_index=True, width="stretch")
     else:
@@ -1816,860 +2956,6 @@ def tab_print_plan():
 
 
 # ---------------------------------------------------------------------------
-# TAB — Crew Flow Map (time-dependent Sankey + coverage bubble chart)
-# ---------------------------------------------------------------------------
-def tab_flow_map():
-    ss = st.session_state
-    d = derived()
-
-    section_header("Crew Flow Map")
-    info_panel(
-        "Visualises how pilots move through the fleet network over your planning "
-        "horizon. The <b>Sankey</b> shows who transitions from where to where. "
-        "The <b>coverage bubble chart</b> shows requirement vs availability at a "
-        "glance — bubble size is fleet size, colour is gap severity, position "
-        "shows localisation and coverage. Both are fully interactive — hover any "
-        "band or bubble to drill into it.",
-        kind="info",
-    )
-
-    c1, c2, c3 = st.columns([2, 2, 3])
-    with c1:
-        view = st.selectbox(
-            "Visualisation",
-            ["Sankey — pilot transitions", "Bubble chart — coverage over time",
-             "Network — fleet interconnections"],
-            key="fm_view",
-        )
-    with c2:
-        snapshot_month = st.selectbox(
-            "Snapshot at end of month",
-            options=list(range(ss.horizon)),
-            format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}",
-            index=ss.horizon - 1,
-            key="fm_snapshot",
-        )
-    with c3:
-        st.caption(
-            "Use the snapshot selector to see the state of your plan at any "
-            "point in the horizon. Dragging, zooming, and hover-to-drill all "
-            "work on the visualisations below."
-        )
-
-    if view == "Sankey — pilot transitions":
-        _flow_sankey(d, snapshot_month)
-    elif view == "Bubble chart — coverage over time":
-        _flow_bubble(d)
-    else:
-        _flow_network(d, snapshot_month)
-
-
-def _flow_node_label(fleet: str, function: str, nationality: str) -> str:
-    return f"{fleet} {function[:3]} · {nationality[:3]}"
-
-
-def _flow_sankey(d, up_to_month: int):
-    """
-    Two Sankey sub-views:
-      - Classic: start state (left) → end state at snapshot (right), one column each.
-      - Time-aware: one column per month, pilots flow forward whenever an action
-        they're in completes. This shows WHEN transitions happen.
-    """
-    ss = st.session_state
-
-    # ---- Filters (shared between sub-views) ------------------------------
-    st.markdown("**Filters**")
-    fc1, fc2, fc3, fc4 = st.columns(4)
-    with fc1:
-        filt_fleets = st.multiselect(
-            "Show flows touching fleets",
-            options=FLEETS, default=FLEETS, key="fm_sk_fleets",
-            help="A flow is shown if EITHER its origin or destination fleet is in this set.",
-        )
-    with fc2:
-        filt_funcs = st.multiselect(
-            "Show flows touching functions",
-            options=FUNCTIONS, default=FUNCTIONS, key="fm_sk_funcs",
-        )
-    with fc3:
-        filt_nats = st.multiselect(
-            "Show flows by nationality",
-            options=NATIONALITIES, default=NATIONALITIES, key="fm_sk_nats",
-        )
-    with fc4:
-        show_static = st.checkbox(
-            "Hide non-movers",
-            value=True, key="fm_sk_hide_static",
-            help="Hide pilots whose position never changes across the horizon.",
-        )
-
-    layout_mode = st.radio(
-        "Sankey layout",
-        ["Time-aware (one column per month with activity)",
-         "Classic (start → end only)"],
-        horizontal=True, key="fm_sk_layout",
-    )
-
-    if layout_mode.startswith("Time-aware"):
-        _flow_sankey_time_aware(
-            d, up_to_month,
-            filt_fleets, filt_funcs, filt_nats, show_static,
-        )
-    else:
-        _flow_sankey_classic(
-            d, up_to_month,
-            filt_fleets, filt_funcs, filt_nats, show_static,
-        )
-
-
-def _flow_sankey_classic(d, up_to_month, filt_fleets, filt_funcs, filt_nats, show_static):
-    """Original two-column start → end Sankey."""
-    ss = st.session_state
-
-    combos: list[tuple[str, str, str]] = []
-    for f in FLEETS:
-        for fn in FUNCTIONS:
-            for nat in NATIONALITIES:
-                combos.append((f, fn, nat))
-    N = len(combos)
-    src_idx = {combos[i]: i for i in range(N)}
-    dst_idx = {combos[i]: i + N for i in range(N)}
-    hire_local_idx = 2 * N
-    hire_expat_idx = 2 * N + 1
-
-    def _node_label(combo, suffix):
-        f, fn, nat = combo
-        fn_short = "CPT" if fn == "Captain" else "FO"
-        nat_short = "LOC" if nat == "Local" else "EXP"
-        return f"{f}  {fn_short}  {nat_short}   {suffix}"
-
-    labels = (
-        [_node_label(c, "start") for c in combos]
-        + [_node_label(c, "end  ") for c in combos]
-        + ["New hire — Local", "New hire — Expat"]
-    )
-
-    def _node_color(combo):
-        f, fn, nat = combo
-        alpha = 0.95 if nat == "Local" else 0.60
-        return _fleet_function_color(f, fn, alpha)
-
-    node_colors = (
-        [_node_color(c) for c in combos]
-        + [_node_color(c) for c in combos]
-        + ["rgba(22,163,74,0.85)", "rgba(220,38,38,0.65)"]
-    )
-    node_x = [0.01] * N + [0.99] * N + [0.01, 0.01]
-
-    pilot_by_id = {p.employee_id: p for p in ss.pilots}
-    pilot_dest: dict[str, tuple[str, str, str]] = {
-        p.employee_id: (p.fleet, p.function, p.nationality)
-        for p in ss.pilots if p.fleet in FLEETS
-    }
-    flows: dict[tuple[int, int], dict] = {}
-
-    def _bump(src, dst, desc):
-        key = (src, dst)
-        if key not in flows:
-            flows[key] = {"value": 0, "desc": []}
-        flows[key]["value"] += 1
-        flows[key]["desc"].append(desc)
-
-    for a in sorted(ss.actions, key=lambda x: x.start_month):
-        end = a.start_month + a.duration
-        if end > up_to_month + 1:
-            continue
-
-        if a.action_type == "Type Rating":
-            for tid in a.trainee_ids:
-                if tid.startswith("SEAT:") or tid.startswith("TBD"): continue
-                p = pilot_by_id.get(tid)
-                if not p or p.fleet not in FLEETS: continue
-                new = (a.to_fleet, a.to_function, p.nationality)
-                pilot_dest[tid] = new
-        elif a.action_type == "Command Upgrade":
-            for tid in a.trainee_ids:
-                if tid.startswith("SEAT:") or tid.startswith("TBD"): continue
-                p = pilot_by_id.get(tid)
-                if not p or p.fleet not in FLEETS: continue
-                pilot_dest[tid] = (a.to_fleet, "Captain", p.nationality)
-        elif a.action_type in ("Cadet Hire", "Local Hire") and a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
-            target = (a.to_fleet, a.to_function, "Local")
-            if a.to_fleet in filt_fleets and a.to_function in filt_funcs and "Local" in filt_nats:
-                _bump(hire_local_idx, dst_idx[target], f"Hire: {a.new_pilot_name or 'TBD'}")
-        elif a.action_type == "Expat Hire" and a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
-            target = (a.to_fleet, a.to_function, "Expat")
-            if a.to_fleet in filt_fleets and a.to_function in filt_funcs and "Expat" in filt_nats:
-                _bump(hire_expat_idx, dst_idx[target], f"Hire: {a.new_pilot_name or 'TBD'}")
-
-    for pid, dest in pilot_dest.items():
-        p = pilot_by_id.get(pid)
-        if not p or p.fleet not in FLEETS: continue
-        src_combo = (p.fleet, p.function, p.nationality)
-        if show_static and src_combo == dest: continue
-        if not (src_combo[0] in filt_fleets or dest[0] in filt_fleets): continue
-        if not (src_combo[1] in filt_funcs or dest[1] in filt_funcs): continue
-        if p.nationality not in filt_nats: continue
-        if src_combo not in src_idx or dest not in dst_idx: continue
-        _bump(src_idx[src_combo], dst_idx[dest], f"{p.employee_id} — {p.full_name}")
-
-    if not flows:
-        info_panel("No flows match the current filters.")
-        return
-
-    _render_sankey_figure(labels, node_colors, node_x, flows, height=720)
-
-
-def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, show_static):
-    """
-    One column per month with activity. Pilots flow forward through time.
-    Each month's column is a snapshot of the pilot population at that month.
-    """
-    ss = st.session_state
-    labels_months = d["labels"][: up_to_month + 1]
-    if not labels_months:
-        info_panel("No months to display."); return
-
-    # Identify "activity months" — months where any action starts or ends
-    activity_months: set[int] = {0, up_to_month}
-    for a in ss.actions:
-        if a.start_month <= up_to_month:
-            activity_months.add(a.start_month)
-        end = a.start_month + a.duration
-        if end <= up_to_month:
-            activity_months.add(end)
-    # Hires also count
-    activity_months = sorted(m for m in activity_months if 0 <= m <= up_to_month)
-
-    # If the horizon has more than 8 activity months, sample to keep readable
-    MAX_COLUMNS = 6
-    if len(activity_months) > MAX_COLUMNS:
-        step = len(activity_months) / MAX_COLUMNS
-        sampled = [activity_months[int(i * step)] for i in range(MAX_COLUMNS)]
-        if activity_months[-1] not in sampled:
-            sampled[-1] = activity_months[-1]
-        activity_months = sampled
-        info_panel(
-            f"Showing {MAX_COLUMNS} time columns (sampled from "
-            f"{len([a for a in ss.actions if a.start_month <= up_to_month])} "
-            "actions). Narrow your snapshot month on the left to zoom in on fewer transitions.",
-            kind="info",
-        )
-
-    # At each activity month, compute every pilot's position
-    pilot_by_id = {p.employee_id: p for p in ss.pilots}
-
-    def position_at(pid, month_idx) -> tuple[str, str, str] | None:
-        p = pilot_by_id.get(pid)
-        if not p or p.fleet not in FLEETS:
-            return None
-        current = (p.fleet, p.function, p.nationality)
-        for a in sorted(ss.actions, key=lambda x: x.start_month):
-            end = a.start_month + a.duration
-            if end > month_idx:
-                continue
-            if pid in a.trainee_ids and not any(
-                t == f"SEAT:{pid}" for t in a.trainee_ids
-            ):
-                if a.action_type == "Type Rating":
-                    current = (a.to_fleet, a.to_function, current[2])
-                elif a.action_type == "Command Upgrade":
-                    current = (a.to_fleet, "Captain", current[2])
-        return current
-
-    # Also fold in hires as they arrive
-    virtual_hires: list[tuple[int, PlannedAction]] = []
-    for a in ss.actions:
-        if a.action_type in ("Cadet Hire", "Local Hire", "Expat Hire"):
-            end = a.start_month + a.duration
-            if end <= up_to_month:
-                virtual_hires.append((end, a))
-
-    # Build nodes: one per (month, fleet, function, nationality) combination
-    # actually used
-    node_ids: list[str] = []
-    node_labels: list[str] = []
-    node_colors: list[str] = []
-    node_x: list[float] = []
-    node_map: dict[tuple[int, str, str, str], int] = {}
-    # Plus two hire source nodes per activity month
-    hire_node_map: dict[tuple[int, str], int] = {}
-
-    def ensure_node(month, combo):
-        key = (month, *combo)
-        if key in node_map:
-            return node_map[key]
-        idx = len(node_ids)
-        node_map[key] = idx
-        f, fn, nat = combo
-        fn_short = "CPT" if fn == "Captain" else "FO"
-        nat_short = "LOC" if nat == "Local" else "EXP"
-        node_ids.append(f"m{month}_{f}_{fn}_{nat}")
-        node_labels.append(f"{f} {fn_short} {nat_short}")
-        alpha = 0.95 if nat == "Local" else 0.60
-        node_colors.append(_fleet_function_color(f, fn, alpha))
-        col_pos = activity_months.index(month) / max(1, len(activity_months) - 1)
-        node_x.append(0.02 + 0.96 * col_pos)
-        return idx
-
-    def ensure_hire_node(month, nat):
-        key = (month, nat)
-        if key in hire_node_map:
-            return hire_node_map[key]
-        idx = len(node_ids)
-        hire_node_map[key] = idx
-        node_ids.append(f"m{month}_hire_{nat}")
-        node_labels.append(f"+ Hire ({nat[:3]})")
-        node_colors.append(
-            "rgba(22,163,74,0.85)" if nat == "Local"
-            else "rgba(220,38,38,0.65)"
-        )
-        col_pos = activity_months.index(month) / max(1, len(activity_months) - 1)
-        node_x.append(0.02 + 0.96 * col_pos)
-        return idx
-
-    flows: dict[tuple[int, int], dict] = {}
-    def _bump(src, dst, desc):
-        key = (src, dst)
-        if key not in flows: flows[key] = {"value": 0, "desc": []}
-        flows[key]["value"] += 1
-        flows[key]["desc"].append(desc)
-
-    # Build snapshots at each activity month
-    snapshots: dict[int, dict[str, tuple[str, str, str]]] = {}
-    for m in activity_months:
-        snap: dict[str, tuple[str, str, str]] = {}
-        for p in ss.pilots:
-            pos = position_at(p.employee_id, m)
-            if pos: snap[p.employee_id] = pos
-        # Fold in hires whose end_month <= m
-        for end, a in virtual_hires:
-            if end <= m:
-                virt_id = f"_virtual_{a.id}"
-                nat = "Local" if a.action_type in ("Cadet Hire", "Local Hire") else "Expat"
-                snap[virt_id] = (a.to_fleet, a.to_function, nat)
-        snapshots[m] = snap
-
-    # Emit flows between consecutive activity months
-    for i in range(len(activity_months) - 1):
-        m0, m1 = activity_months[i], activity_months[i + 1]
-        snap0, snap1 = snapshots[m0], snapshots[m1]
-
-        # Pilots present in snap0 — link to their snap1 position if they still exist
-        for pid, pos0 in snap0.items():
-            # Filter
-            if pos0[0] not in filt_fleets: continue
-            if pos0[1] not in filt_funcs: continue
-            if pos0[2] not in filt_nats: continue
-
-            pos1 = snap1.get(pid)
-            if pos1 is None: continue
-            if show_static and pos0 == pos1: continue
-
-            src = ensure_node(m0, pos0)
-            dst = ensure_node(m1, pos1)
-            p = pilot_by_id.get(pid)
-            name = p.full_name if p else pid
-            _bump(src, dst, f"{pid} — {name}")
-
-        # New hires that arrived in (m0, m1]: link from Hire node at m1
-        for end, a in virtual_hires:
-            if m0 < end <= m1:
-                nat = "Local" if a.action_type in ("Cadet Hire", "Local Hire") else "Expat"
-                if a.to_fleet not in filt_fleets: continue
-                if a.to_function not in filt_funcs: continue
-                if nat not in filt_nats: continue
-                src = ensure_hire_node(m1, nat)
-                dst = ensure_node(m1, (a.to_fleet, a.to_function, nat))
-                _bump(src, dst, f"Hire: {a.new_pilot_name or 'TBD'}")
-
-    if not flows:
-        info_panel(
-            "No flows match the current filters. Widen filters or untick "
-            "<b>Hide non-movers</b> to see pilots who stay in place."
-        )
-        return
-
-    _render_sankey_figure(
-        node_labels, node_colors, node_x, flows,
-        height=760,
-        column_labels=[d["labels"][m] for m in activity_months],
-        column_positions=[0.02 + 0.96 * (i / max(1, len(activity_months) - 1))
-                          for i in range(len(activity_months))],
-    )
-
-
-def _render_sankey_figure(
-    labels, node_colors, node_x, flows,
-    height=720, column_labels=None, column_positions=None,
-):
-    """Shared Sankey renderer with consistent typography and hover format."""
-    sources = [k[0] for k in flows.keys()]
-    targets = [k[1] for k in flows.keys()]
-    values = [v["value"] for v in flows.values()]
-
-    hovers = []
-    for k, v in flows.items():
-        s_lbl = labels[k[0]].strip()
-        t_lbl = labels[k[1]].strip()
-        desc = v["desc"][:10]
-        more = f"<br>…and {len(v['desc']) - 10} more" if len(v["desc"]) > 10 else ""
-        hovers.append(
-            f"<b>{s_lbl}</b><br>↓<br><b>{t_lbl}</b><br>"
-            f"<b>Count: {v['value']}</b><br><br>"
-            + "<br>".join(desc) + more
-        )
-
-    def _link_color(src_i):
-        c = node_colors[src_i]
-        if c.startswith("rgba"):
-            parts = c[5:-1].split(",")
-            return f"rgba({parts[0]},{parts[1]},{parts[2]},0.45)"
-        return c
-    link_colors = [_link_color(s) for s in sources]
-
-    fig = go.Figure(go.Sankey(
-        arrangement="snap",
-        node=dict(
-            pad=22, thickness=18,
-            line=dict(color="white", width=1.5),
-            label=labels, color=node_colors,
-            x=node_x,
-            hovertemplate="<b>%{label}</b><br>Total: %{value} pilots<extra></extra>",
-        ),
-        link=dict(
-            source=sources, target=targets, value=values,
-            color=link_colors,
-            customdata=hovers,
-            hovertemplate="%{customdata}<extra></extra>",
-            line=dict(color="rgba(255,255,255,0.2)", width=0.3),
-        ),
-        textfont=dict(family="Inter, sans-serif", size=12, color=COLORS["navy"]),
-    ))
-
-    # Add column-header time labels if provided
-    annotations = []
-    if column_labels and column_positions:
-        for lbl, xp in zip(column_labels, column_positions):
-            annotations.append(dict(
-                x=xp, y=1.06, xref="paper", yref="paper",
-                text=f"<b>{lbl}</b>",
-                showarrow=False,
-                font=dict(size=12, color=COLORS["accent"], family="Inter, sans-serif"),
-                align="center",
-            ))
-
-    fig.update_layout(
-        height=height,
-        margin=dict(l=10, r=10, t=60 if annotations else 30, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Inter, sans-serif", size=12, color=COLORS["navy"]),
-        annotations=annotations,
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown(
-        f"""
-        <div style="background:{COLORS['surface']}; border:1px solid {COLORS['border']};
-             border-radius:10px; padding:12px 16px; margin-top:8px; font-size:12px;">
-            <b>How to read this:</b> each node is
-            <i>Fleet · Function · Nationality</i>. Band thickness = pilot count.
-            Band colour keys on the <i>source</i> fleet — follow a colour to trace
-            one fleet's outflow. Hover any band for the exact pilot list.
-            {"The bold labels above each column mark the time point of that snapshot." if column_labels else ""}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    section_header("Flow summary")
-    rows = []
-    for k, v in sorted(flows.items(), key=lambda kv: -kv[1]["value"]):
-        rows.append({
-            "From": labels[k[0]].strip(),
-            "To": labels[k[1]].strip(),
-            "Pilots": v["value"],
-            "First few": ", ".join(v["desc"][:3]) + ("…" if len(v["desc"]) > 3 else ""),
-        })
-    if rows:
-        st.dataframe(_safe_df(rows), hide_index=True, height=300, width="stretch")
-
-
-def _flow_bubble(d):
-    """
-    Animated bubble chart: each bubble = fleet × function. Position shows
-    localisation vs available pilots; size shows total pilots; colour shows
-    gap severity. Plays through the horizon.
-    """
-    ss = st.session_state
-
-    fleet_fn_pairs = [(f, fn) for f in FLEETS for fn in FUNCTIONS]
-    pilot_snapshots: dict[int, list] = {m: list(ss.pilots) for m in range(ss.horizon)}
-    for m in range(ss.horizon):
-        for a in ss.actions:
-            end = a.start_month + a.duration
-            if end <= m and a.action_type in ("Cadet Hire", "Local Hire", "Expat Hire"):
-                nat = "Local" if a.action_type in ("Cadet Hire", "Local Hire") else "Expat"
-                pilot_snapshots[m].append(Pilot(
-                    employee_id=f"_virtual_{a.id}", full_name=a.new_pilot_name or "TBD",
-                    nationality=nat, fleet=a.to_fleet, function=a.to_function,
-                    designations=[], management=False, status="Active",
-                ))
-
-    rows = []
-    for m in range(ss.horizon):
-        snap = pilot_snapshots[m]
-        for f, fn in fleet_fn_pairs:
-            group = [p for p in snap if p.fleet == f and p.function == fn]
-            if not group: continue
-            total = len(group)
-            local = sum(1 for p in group if p.nationality == "Local")
-            local_pct = (local / total * 100) if total else 0
-            req = d["req"][f][fn][m]
-            av = d["avail"][f][fn][m]
-            gap = max(0.0, req - av)
-            rows.append({
-                "month_idx": m, "month": d["labels"][m],
-                "fleet_fn": f"{f} {fn[:3]}",
-                "fleet": f, "function": fn,
-                "local_pct": local_pct,
-                "total": total, "req": req, "av": av, "gap": gap,
-                "band": gap_band(gap),
-            })
-
-    if not rows:
-        info_panel("No data to display."); return
-
-    df = pd.DataFrame(rows)
-    band_color = {"green": COLORS["green"], "amber": COLORS["amber"], "red": COLORS["red"]}
-
-    # Axis ranges derived from the full dataset so bubbles don't jump scale
-    y_max = max(df["av"].max(), df["req"].max()) * 1.15
-    y_max = max(y_max, 10)
-
-    frames = []
-    for m in range(ss.horizon):
-        sub = df[df.month_idx == m]
-        if sub.empty: continue
-
-        # Draw the requirement as a faint background marker so the gap is visible
-        traces = [
-            # Requirement line (light, behind the bubbles)
-            go.Scatter(
-                x=sub["local_pct"], y=sub["req"],
-                mode="markers",
-                marker=dict(
-                    symbol="line-ew", size=30,
-                    line=dict(color=COLORS["text_muted"], width=2),
-                ),
-                hoverinfo="skip",
-                showlegend=False,
-            ),
-            # Actual availability bubbles
-            go.Scatter(
-                x=sub["local_pct"], y=sub["av"],
-                mode="markers+text",
-                marker=dict(
-                    size=sub["total"] * 2.5 + 18,
-                    color=[band_color[b] for b in sub["band"]],
-                    line=dict(color=COLORS["navy"], width=1.8),
-                    opacity=0.88,
-                    sizemode="diameter",
-                ),
-                text=sub["fleet_fn"],
-                textposition="middle center",
-                textfont=dict(size=10, color="white", family="Inter"),
-                customdata=sub[["fleet_fn", "total", "req", "av", "gap",
-                                "local_pct", "month", "band"]].values,
-                hovertemplate=(
-                    "<b>%{customdata[0]}</b><br>"
-                    "Month: %{customdata[6]}<br>"
-                    "Pilots: %{customdata[1]}<br>"
-                    "Required: %{customdata[2]}<br>"
-                    "Available: %{customdata[3]:.1f}<br>"
-                    "Gap: %{customdata[4]:.1f} (%{customdata[7]})<br>"
-                    "Local: %{customdata[5]:.0f}%<extra></extra>"
-                ),
-                showlegend=False,
-            ),
-        ]
-        frames.append(go.Frame(name=d["labels"][m], data=traces))
-
-    if not frames:
-        info_panel("No data to display."); return
-
-    fig = go.Figure(data=frames[0].data)
-    fig.frames = frames
-
-    steps = []
-    for fr in frames:
-        steps.append(dict(
-            method="animate", label=fr.name,
-            args=[[fr.name], dict(mode="immediate",
-                                  frame=dict(duration=0, redraw=True),
-                                  transition=dict(duration=300))],
-        ))
-
-    # Add 3 coloured background bands (green/amber/red) to show localisation target zones
-    fig.update_layout(
-        height=640,
-        xaxis=dict(
-            title=dict(text="Localisation %", font=dict(size=13)),
-            range=[-3, 105],
-            showgrid=True, gridcolor=COLORS["border"],
-            zeroline=False,
-        ),
-        yaxis=dict(
-            title=dict(text="Available pilots (dash = required)", font=dict(size=13)),
-            range=[0, y_max],
-            showgrid=True, gridcolor=COLORS["border"],
-        ),
-        shapes=[
-            # Localisation target zones
-            dict(type="rect", xref="x", yref="paper",
-                 x0=0, x1=50, y0=0, y1=1,
-                 fillcolor="rgba(220,38,38,0.035)",
-                 line=dict(width=0), layer="below"),
-            dict(type="rect", xref="x", yref="paper",
-                 x0=50, x1=80, y0=0, y1=1,
-                 fillcolor="rgba(217,119,6,0.035)",
-                 line=dict(width=0), layer="below"),
-            dict(type="rect", xref="x", yref="paper",
-                 x0=80, x1=100, y0=0, y1=1,
-                 fillcolor="rgba(22,163,74,0.04)",
-                 line=dict(width=0), layer="below"),
-        ],
-        annotations=[
-            dict(x=25, y=1.02, xref="x", yref="paper", text="Low localisation",
-                 showarrow=False, font=dict(size=10, color=COLORS["red"])),
-            dict(x=65, y=1.02, xref="x", yref="paper", text="Partial",
-                 showarrow=False, font=dict(size=10, color=COLORS["amber"])),
-            dict(x=90, y=1.02, xref="x", yref="paper", text="High localisation",
-                 showarrow=False, font=dict(size=10, color=COLORS["green"])),
-        ],
-        margin=dict(l=70, r=30, t=50, b=100),
-        sliders=[dict(
-            active=0,
-            currentvalue=dict(prefix="Month: ", font=dict(size=13, color=COLORS["navy"])),
-            pad=dict(t=40), steps=steps,
-            bgcolor=COLORS["surface"],
-            bordercolor=COLORS["border"],
-            tickcolor=COLORS["accent"],
-        )],
-        updatemenus=[dict(
-            type="buttons", showactive=False,
-            x=0.02, y=-0.12, xanchor="left", yanchor="top",
-            bgcolor=COLORS["surface"], bordercolor=COLORS["border"],
-            buttons=[
-                dict(label="▶ Play", method="animate",
-                     args=[None, dict(frame=dict(duration=500, redraw=True),
-                                      fromcurrent=True,
-                                      transition=dict(duration=250))]),
-                dict(label="⏸ Pause", method="animate",
-                     args=[[None], dict(frame=dict(duration=0, redraw=False),
-                                        mode="immediate")]),
-            ],
-        )],
-        plot_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown(
-        f"""
-        <div style="background:{COLORS['surface']}; border:1px solid {COLORS['border']};
-             border-radius:10px; padding:12px 16px; margin-top:8px; font-size:12px;">
-            <b>How to read this:</b> each bubble is a fleet × function.
-            <b>X-axis</b> = localisation percentage.
-            <b>Y-axis</b> = available pilots (the horizontal dash above each bubble
-            marks the requirement — the gap between dash and bubble is the shortfall).
-            <b>Size</b> = total pilots in that group.
-            <b>Colour</b> = gap severity (green / amber / red).
-            Drag the slider or hit <b>▶ Play</b> to watch the plan unfold.
-            The faint background bands mark localisation target zones.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _flow_network(d, up_to_month: int):
-    """
-    Hub-and-spoke network: fleets around a circle, Captains outer ring, FOs inner.
-    Edge colour = warning state, thickness = transition volume.
-    """
-    ss = st.session_state
-    import math
-
-    nodes = []
-    node_idx: dict[tuple[str, str], int] = {}
-    for i, f in enumerate(FLEETS):
-        for fn in FUNCTIONS:
-            node_idx[(f, fn)] = len(nodes)
-            angle = 2 * math.pi * i / len(FLEETS) - math.pi / 2  # start at top
-            radius = 1.0 if fn == "Captain" else 0.58
-            req = d["req"][f][fn][up_to_month]
-            av = d["avail"][f][fn][up_to_month]
-            gap = max(0, req - av)
-            nodes.append({
-                "x": radius * math.cos(angle),
-                "y": radius * math.sin(angle),
-                "label_fleet": f,
-                "label_fn": "Captain" if fn == "Captain" else "First Officer",
-                "fleet": f, "function": fn,
-                "size": max(22, av * 2.2 + 18),
-                "req": req, "av": av, "gap": gap,
-                "band": gap_band(gap),
-            })
-
-    edge_counts: dict[tuple[int, int], int] = {}
-    edge_actions: dict[tuple[int, int], list[str]] = {}
-    for a in ss.actions:
-        if a.start_month + a.duration > up_to_month + 1: continue
-        if a.action_type == "Type Rating":
-            if (a.from_fleet, a.from_function) in node_idx and (a.to_fleet, a.to_function) in node_idx:
-                key = (node_idx[(a.from_fleet, a.from_function)],
-                       node_idx[(a.to_fleet, a.to_function)])
-                # Count non-seat trainees only
-                count = sum(1 for t in a.trainee_ids if not t.startswith("SEAT:"))
-                edge_counts[key] = edge_counts.get(key, 0) + count
-                edge_actions.setdefault(key, []).append(
-                    f"TR {a.from_fleet} {a.from_function[:3]} → "
-                    f"{a.to_fleet} {a.to_function[:3]} at {d['labels'][a.start_month]}"
-                )
-        elif a.action_type == "Command Upgrade":
-            if (a.from_fleet, "First Officer") in node_idx and (a.to_fleet, "Captain") in node_idx:
-                key = (node_idx[(a.from_fleet, "First Officer")],
-                       node_idx[(a.to_fleet, "Captain")])
-                count = sum(1 for t in a.trainee_ids if not t.startswith("SEAT:"))
-                edge_counts[key] = edge_counts.get(key, 0) + count
-                edge_actions.setdefault(key, []).append(
-                    f"CU {a.from_fleet} → {a.to_fleet} CPT at {d['labels'][a.start_month]}"
-                )
-
-    fig = go.Figure()
-
-    # Ring guides — two faint circles to make the outer/inner ring explicit
-    for r, lbl in [(1.0, "Captains"), (0.58, "First Officers")]:
-        theta = [i * 2 * math.pi / 60 for i in range(61)]
-        fig.add_trace(go.Scatter(
-            x=[r * math.cos(t) for t in theta],
-            y=[r * math.sin(t) for t in theta],
-            mode="lines",
-            line=dict(color=COLORS["border"], width=1, dash="dot"),
-            hoverinfo="skip", showlegend=False,
-        ))
-        fig.add_annotation(
-            x=0, y=r + 0.08, text=lbl,
-            showarrow=False, font=dict(size=10, color=COLORS["text_muted"]),
-        )
-
-    # Edges — curved, thickness proportional to volume
-    for (src, tgt), count in edge_counts.items():
-        x0, y0 = nodes[src]["x"], nodes[src]["y"]
-        x1, y1 = nodes[tgt]["x"], nodes[tgt]["y"]
-        # Curve through a midpoint offset perpendicular to the direct line
-        mx = (x0 + x1) / 2 + (y1 - y0) * 0.22
-        my = (y0 + y1) / 2 - (x1 - x0) * 0.22
-        # Arc via 20 bezier-ish points
-        arc_x = [x0 + (mx - x0) * t + (x1 - mx) * t * t * 0 for t in [i / 20 for i in range(21)]]
-        # Simpler: quadratic bezier
-        pts = []
-        for i in range(21):
-            t = i / 20
-            bx = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * mx + t ** 2 * x1
-            by = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * my + t ** 2 * y1
-            pts.append((bx, by))
-        fig.add_trace(go.Scatter(
-            x=[p[0] for p in pts], y=[p[1] for p in pts],
-            mode="lines",
-            line=dict(color=COLORS["accent"], width=min(14, 3 + count * 1.6)),
-            opacity=0.55, hoverinfo="skip", showlegend=False,
-        ))
-        # Arrowhead as a marker at the 0.9 point
-        ax, ay = pts[18]
-        fig.add_trace(go.Scatter(
-            x=[ax], y=[ay], mode="markers",
-            marker=dict(symbol="triangle-right", size=14, color=COLORS["accent"]),
-            hoverinfo="skip", showlegend=False,
-        ))
-        # Label in a pill on the arc midpoint
-        fig.add_trace(go.Scatter(
-            x=[mx], y=[my], mode="markers+text",
-            marker=dict(size=22, color="white",
-                        line=dict(color=COLORS["accent"], width=2)),
-            text=[f"<b>{count}</b>"],
-            textfont=dict(size=11, color=COLORS["navy"]),
-            hovertext="<br>".join(edge_actions[(src, tgt)]),
-            hoverinfo="text", showlegend=False,
-        ))
-
-    # Nodes
-    band_ring = {"green": COLORS["green"], "amber": COLORS["amber"], "red": COLORS["red"]}
-
-    for n in nodes:
-        # Coloured halo showing gap band
-        fig.add_trace(go.Scatter(
-            x=[n["x"]], y=[n["y"]],
-            mode="markers",
-            marker=dict(size=n["size"] + 12, color=band_ring[n["band"]],
-                        opacity=0.25, line=dict(width=0)),
-            hoverinfo="skip", showlegend=False,
-        ))
-        # Fleet-coloured node
-        col = _fleet_function_color(n["fleet"], n["function"])
-        fig.add_trace(go.Scatter(
-            x=[n["x"]], y=[n["y"]], mode="markers",
-            marker=dict(size=n["size"], color=col,
-                        line=dict(color="white", width=2.5)),
-            hovertext=(
-                f"<b>{n['label_fleet']} {n['label_fn']}</b><br>"
-                f"Required: {n['req']}<br>Available: {n['av']:.1f}<br>"
-                f"Gap: {n['gap']:.1f} ({n['band']})"
-            ),
-            hoverinfo="text", showlegend=False,
-        ))
-        # Label
-        fig.add_annotation(
-            x=n["x"], y=n["y"],
-            text=f"<b>{n['label_fleet']}</b><br>"
-                 f"<span style='font-size:9px'>{'CPT' if n['function'] == 'Captain' else 'FO'}</span>",
-            showarrow=False,
-            font=dict(size=11, color="white", family="Inter"),
-            align="center",
-        )
-
-    fig.update_layout(
-        height=680,
-        xaxis=dict(visible=False, range=[-1.4, 1.4]),
-        yaxis=dict(visible=False, range=[-1.35, 1.35],
-                   scaleanchor="x", scaleratio=1),
-        margin=dict(l=10, r=10, t=10, b=10),
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Legend
-    st.markdown(
-        f"""
-        <div style="background:{COLORS['surface']}; border:1px solid {COLORS['border']};
-             border-radius:10px; padding:12px 16px; margin-top:8px; font-size:12px;
-             display:flex; gap:28px; flex-wrap:wrap; align-items:center;">
-            <b>Legend:</b>
-            <span>⬤ Outer ring = <b>Captains</b></span>
-            <span>⬤ Inner ring = <b>First Officers</b></span>
-            <span style="color:{COLORS['green']}">●</span> Gap met
-            <span style="color:{COLORS['amber']}">●</span> 1 short
-            <span style="color:{COLORS['red']}">●</span> 2+ short
-            <span>Edge thickness = pilot count crossing that route by the snapshot month.</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Main — with per-tab crash isolation
 # ---------------------------------------------------------------------------
 def main():
@@ -2677,15 +2963,27 @@ def main():
     render_topbar()
 
     tabs = st.tabs([
-        "📊 Dashboard", "👥 Registry", "✈ Fleet Planner", "📅 Timeline",
-        "🎯 Action Planner", "🌐 Flow Map", "🌏 Localisation",
-        "🤖 AI Optimiser", "🖨 Print Plan",
+        "📊 Dashboard",
+        "👥 Registry",
+        "✈ Fleet Planner",
+        "📅 Timeline",
+        "🎯 Action Planner",
+        "🌐 Flow Map",
+        "🌏 Localisation",
+        "🤖 AI Optimiser",
+        "🖨 Print Plan",
     ])
 
     tab_funcs = [
-        tab_dashboard, tab_registry, tab_fleet_planner, tab_timeline,
-        tab_action_planner, tab_flow_map, tab_localisation,
-        tab_ai_optimiser, tab_print_plan,
+        tab_dashboard,
+        tab_registry,
+        tab_fleet_planner,
+        tab_timeline,
+        tab_action_planner,
+        tab_flow_map,
+        tab_localisation,
+        tab_ai_optimiser,
+        tab_print_plan,
     ]
 
     for tab, fn in zip(tabs, tab_funcs):
@@ -2702,3 +3000,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
