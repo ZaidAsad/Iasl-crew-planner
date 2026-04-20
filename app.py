@@ -2021,10 +2021,17 @@ def _flow_sankey_classic(d, up_to_month, filt_fleets, filt_funcs, filt_nats, sho
     )
     node_x = [0.01] * N + [0.99] * N + [0.01, 0.01]
 
-    pilot_by_id = {p.employee_id: p for p in ss.pilots}
+    terminated: set[str] = set()
+    for a in ss.actions:
+        if a.action_type == "Pilot Termination" and a.start_month <= up_to_month:
+            for tid in a.trainee_ids:
+                if not tid.startswith("TBD"):
+                    terminated.add(tid)
+
     pilot_dest: dict[str, tuple[str, str, str]] = {
         p.employee_id: (p.fleet, p.function, p.nationality)
-        for p in ss.pilots if p.fleet in FLEETS
+        for p in ss.pilots
+        if p.fleet in FLEETS and p.employee_id not in terminated
     }
     flows: dict[tuple[int, int], dict] = {}
 
@@ -2039,17 +2046,18 @@ def _flow_sankey_classic(d, up_to_month, filt_fleets, filt_funcs, filt_nats, sho
         end = a.start_month + a.duration
         if end > up_to_month + 1:
             continue
-
         if a.action_type == "Type Rating":
             for tid in a.trainee_ids:
                 if tid.startswith("SEAT:") or tid.startswith("TBD"): continue
+                if tid in terminated: continue
                 p = pilot_by_id.get(tid)
                 if not p or p.fleet not in FLEETS: continue
-                new = (a.to_fleet, a.to_function, p.nationality)
+                pilot_dest[tid] = (a.to_fleet, a.to_function, p.nationality)
                 pilot_dest[tid] = new
         elif a.action_type == "Command Upgrade":
             for tid in a.trainee_ids:
                 if tid.startswith("SEAT:") or tid.startswith("TBD"): continue
+                if tid in terminated: continue
                 p = pilot_by_id.get(tid)
                 if not p or p.fleet not in FLEETS: continue
                 pilot_dest[tid] = (a.to_fleet, "Captain", p.nationality)
@@ -2582,16 +2590,35 @@ def _flow_network(d, up_to_month: int):
                 "band": gap_band(gap),
             })
 
+    # Who is terminated by the snapshot month?
+    terminated: set[str] = set()
+    for a in ss.actions:
+        if a.action_type == "Pilot Termination" and a.start_month <= up_to_month:
+            for tid in a.trainee_ids:
+                if not tid.startswith("TBD"):
+                    terminated.add(tid)
+
+    def _effective_trainees(action):
+        n = 0
+        for t in action.trainee_ids:
+            if t.startswith("SEAT:"): continue
+            if t.startswith("TBD"):
+                n += 1
+                continue
+            if t in terminated: continue
+            n += 1
+        return n
+
     edge_counts: dict[tuple[int, int], int] = {}
     edge_actions: dict[tuple[int, int], list[str]] = {}
     for a in ss.actions:
         if a.start_month + a.duration > up_to_month + 1: continue
         if a.action_type == "Type Rating":
             if (a.from_fleet, a.from_function) in node_idx and (a.to_fleet, a.to_function) in node_idx:
+                count = _effective_trainees(a)
+                if count == 0: continue
                 key = (node_idx[(a.from_fleet, a.from_function)],
                        node_idx[(a.to_fleet, a.to_function)])
-                # Count non-seat trainees only
-                count = sum(1 for t in a.trainee_ids if not t.startswith("SEAT:"))
                 edge_counts[key] = edge_counts.get(key, 0) + count
                 edge_actions.setdefault(key, []).append(
                     f"TR {a.from_fleet} {a.from_function[:3]} → "
@@ -2599,9 +2626,10 @@ def _flow_network(d, up_to_month: int):
                 )
         elif a.action_type == "Command Upgrade":
             if (a.from_fleet, "First Officer") in node_idx and (a.to_fleet, "Captain") in node_idx:
+                count = _effective_trainees(a)
+                if count == 0: continue
                 key = (node_idx[(a.from_fleet, "First Officer")],
                        node_idx[(a.to_fleet, "Captain")])
-                count = sum(1 for t in a.trainee_ids if not t.startswith("SEAT:"))
                 edge_counts[key] = edge_counts.get(key, 0) + count
                 edge_actions.setdefault(key, []).append(
                     f"CU {a.from_fleet} → {a.to_fleet} CPT at {d['labels'][a.start_month]}"
