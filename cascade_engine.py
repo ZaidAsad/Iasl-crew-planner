@@ -512,6 +512,12 @@ def eligible_feeders_for(
     pilots: list[Pilot],
     actions: list[PlannedAction] | None = None,
 ) -> list[dict[str, Any]]:
+    """
+    For a given expat position, find local pilots who could fill it and return
+    the route, duration, and feasibility. Excludes pilots who are scheduled
+    for termination (if `actions` is provided).
+    """
+    # Build set of pilots scheduled for termination
     terminated: set[str] = set()
     if actions:
         for a in actions:
