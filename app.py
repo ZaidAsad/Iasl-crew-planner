@@ -991,48 +991,163 @@ def _pilot_picker(label, key, fleet_filter=None, function_filter=None,
 
 def _form_type_rating(d):
     ss = st.session_state
+
+    # Mode selector — single vs bulk
+    plan_mode = st.radio(
+        "Planning mode",
+        ["Single cohort", "Bulk — repeat across multiple months"],
+        horizontal=True, key="tr_plan_mode",
+        help=(
+            "Single cohort: one action starting at one month. "
+            "Bulk: clone the same action shape across several start months — "
+            "useful when you have 2-3 identical-shape type ratings spaced out."
+        ),
+    )
+
     c1, c2, c3 = st.columns(3)
     with c1:
         from_fleet = st.selectbox("From fleet", FLEETS, key="tr_from_fleet")
-        from_function = st.selectbox("From function", FUNCTIONS, key="tr_from_func")
     with c2:
         to_fleet = st.selectbox("To fleet", FLEETS, key="tr_to_fleet")
-        to_function = st.selectbox("To function", FUNCTIONS, key="tr_to_func")
     with c3:
         mode = st.selectbox("Mode", ["External", "Internal"], key="tr_mode")
-        start = _month_selector(d, "tr_start")
 
-    duration = _suggest_duration("Type Rating", from_fleet, from_function, to_fleet, to_function)
-    duration = st.number_input("Duration (months)", 1, 12, duration, key="tr_dur")
+    # Function routing — allow mixed or same-function trainees in one cohort
+    st.markdown("**Trainee routing** (what each trainee's function becomes)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        route_cpt = st.checkbox(
+            "Include Captain(s): CPT → CPT",
+            value=False, key="tr_route_cpt",
+            help=f"Captains on {from_fleet} transitioning to Captains on {to_fleet}",
+        )
+    with c2:
+        route_fo = st.checkbox(
+            "Include First Officer(s): FO → FO",
+            value=True, key="tr_route_fo",
+            help=f"First Officers on {from_fleet} transitioning to First Officers on {to_fleet}",
+        )
+    with c3:
+        max_total = st.number_input(
+            "Max trainees total (across roles)",
+            min_value=1, max_value=4, value=2,
+            key="tr_max_total",
+            help="Standard cohort is 2. Physically feasible up to 4 for an External course.",
+        )
 
-    st.markdown("**Trainees** (up to 2)")
-    trainees = _pilot_picker("Select trainees", "tr_trainees",
-                             fleet_filter=[from_fleet],
-                             function_filter=[from_function],
-                             max_selections=2)
+    if not (route_cpt or route_fo):
+        st.warning("Tick at least one of CPT → CPT or FO → FO.")
+
+    # Duration — suggest by longest route
+    suggested = 1
+    if route_cpt:
+        suggested = max(suggested, _suggest_duration("Type Rating", from_fleet, "Captain", to_fleet, "Captain"))
+    if route_fo:
+        suggested = max(suggested, _suggest_duration("Type Rating", from_fleet, "First Officer", to_fleet, "First Officer"))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        duration = st.number_input("Duration (months)", 1, 12, suggested, key="tr_dur")
+    with c2:
+        if plan_mode == "Single cohort":
+            start_months = [_month_selector(d, "tr_start")]
+        else:
+            start_months = st.multiselect(
+                "Start months (one action per month)",
+                options=list(range(ss.horizon)),
+                format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}" if i < len(d['labels']) else str(i),
+                key="tr_start_bulk",
+                placeholder="Pick 2 or more months to clone this action into…",
+            )
+
+    # Pilot picker sections — one per role, both shown at once
+    st.markdown("---")
+
+    cpt_trainees: list[str] = []
+    fo_trainees: list[str] = []
+
+    if route_cpt:
+        st.markdown(f"**Captain trainees** ({from_fleet} → {to_fleet} Captain)")
+        cpt_trainees = _pilot_picker(
+            "Captain trainees", "tr_cpt_trainees",
+            fleet_filter=[from_fleet],
+            function_filter=["Captain"],
+            max_selections=max_total,
+        )
+
+    if route_fo:
+        st.markdown(f"**First Officer trainees** ({from_fleet} → {to_fleet} First Officer)")
+        fo_trainees = _pilot_picker(
+            "First Officer trainees", "tr_fo_trainees",
+            fleet_filter=[from_fleet],
+            function_filter=["First Officer"],
+            max_selections=max_total,
+        )
+
+    total_trainees = len(cpt_trainees) + len(fo_trainees)
+    if total_trainees > max_total:
+        st.warning(
+            f"Selected {total_trainees} trainees but cap is {max_total}. "
+            "Reduce selections or increase the cap above."
+        )
 
     instructor = ""
     if mode == "Internal":
-        st.markdown("**Instructor** (destination fleet Captain)")
-        il = _pilot_picker("Instructor", "tr_instructor",
-                           fleet_filter=[to_fleet], function_filter=["Captain"],
-                           max_selections=1)
+        st.markdown("**Instructor** (destination fleet Captain, off line ops for duration)")
+        il = _pilot_picker(
+            "Instructor", "tr_instructor",
+            fleet_filter=[to_fleet], function_filter=["Captain"],
+            max_selections=1,
+        )
         instructor = il[0] if il else ""
 
     note = st.text_input("Note (optional)", key="tr_note")
 
-    if st.form_submit_button("Add Type Rating", type="primary"):
-        if not trainees:
-            st.error("Pick at least one trainee.")
+    if st.form_submit_button("Add Type Rating action(s)", type="primary"):
+        if not (route_cpt or route_fo):
+            st.error("Tick at least one routing option.")
+        elif total_trainees == 0:
+            st.error("Select at least one trainee.")
+        elif total_trainees > max_total:
+            st.error(f"Too many trainees ({total_trainees} > {max_total}).")
+        elif plan_mode == "Bulk — repeat across multiple months" and not start_months:
+            st.error("Pick at least one start month for bulk mode.")
         else:
-            ss.actions.append(PlannedAction(
-                id=new_id("act"), action_type="Type Rating",
-                start_month=start, duration=duration, mode=mode,
-                instructor_id=instructor, trainee_ids=trainees,
-                from_fleet=from_fleet, from_function=from_function,
-                to_fleet=to_fleet, to_function=to_function, note=note,
-            ))
-            st.success("Type Rating added."); st.rerun()
+            added = 0
+            # If both routes are selected, the cohort is mixed — one action contains
+            # both CPT and FO trainees, but they have different destinations.
+            # Encode by creating TWO actions per start month (one per route) so the
+            # availability math works cleanly. Same action ID prefix groups them.
+            for start in start_months:
+                group_tag = new_id("grp")
+
+                if route_cpt and cpt_trainees:
+                    ss.actions.append(PlannedAction(
+                        id=new_id("act"), action_type="Type Rating",
+                        start_month=start, duration=duration, mode=mode,
+                        instructor_id=instructor, trainee_ids=list(cpt_trainees),
+                        from_fleet=from_fleet, from_function="Captain",
+                        to_fleet=to_fleet, to_function="Captain",
+                        note=(note + f"  [cohort {group_tag}]").strip(),
+                    ))
+                    added += 1
+
+                if route_fo and fo_trainees:
+                    ss.actions.append(PlannedAction(
+                        id=new_id("act"), action_type="Type Rating",
+                        start_month=start, duration=duration, mode=mode,
+                        # Only attach instructor to the first action per cohort so
+                        # the instructor isn't double-counted off line ops.
+                        instructor_id="" if route_cpt else instructor,
+                        trainee_ids=list(fo_trainees),
+                        from_fleet=from_fleet, from_function="First Officer",
+                        to_fleet=to_fleet, to_function="First Officer",
+                        note=(note + f"  [cohort {group_tag}]").strip(),
+                    ))
+                    added += 1
+
+            st.success(f"Added {added} Type Rating action(s) across {len(start_months)} month(s).")
+            st.rerun()
 
 
 def _form_command_upgrade(d):
@@ -1650,6 +1765,503 @@ def tab_print_plan():
 
 
 # ---------------------------------------------------------------------------
+# TAB — Crew Flow Map (time-dependent Sankey + coverage bubble chart)
+# ---------------------------------------------------------------------------
+def tab_flow_map():
+    ss = st.session_state
+    d = derived()
+
+    section_header("Crew Flow Map")
+    info_panel(
+        "Visualises how pilots move through the fleet network over your planning "
+        "horizon. The <b>Sankey</b> shows who transitions from where to where. "
+        "The <b>coverage bubble chart</b> shows requirement vs availability at a "
+        "glance — bubble size is fleet size, colour is gap severity, position "
+        "shows localisation and coverage. Both are fully interactive — hover any "
+        "band or bubble to drill into it.",
+        kind="info",
+    )
+
+    c1, c2, c3 = st.columns([2, 2, 3])
+    with c1:
+        view = st.selectbox(
+            "Visualisation",
+            ["Sankey — pilot transitions", "Bubble chart — coverage over time",
+             "Network — fleet interconnections"],
+            key="fm_view",
+        )
+    with c2:
+        snapshot_month = st.selectbox(
+            "Snapshot at end of month",
+            options=list(range(ss.horizon)),
+            format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}",
+            index=ss.horizon - 1,
+            key="fm_snapshot",
+        )
+    with c3:
+        st.caption(
+            "Use the snapshot selector to see the state of your plan at any "
+            "point in the horizon. Dragging, zooming, and hover-to-drill all "
+            "work on the visualisations below."
+        )
+
+    if view == "Sankey — pilot transitions":
+        _flow_sankey(d, snapshot_month)
+    elif view == "Bubble chart — coverage over time":
+        _flow_bubble(d)
+    else:
+        _flow_network(d, snapshot_month)
+
+
+def _flow_node_label(fleet: str, function: str, nationality: str) -> str:
+    return f"{fleet} {function[:3]} · {nationality[:3]}"
+
+
+def _flow_sankey(d, up_to_month: int):
+    """
+    Sankey of pilot flows from month 0 (current registry state) to end of the
+    selected snapshot month, following planned actions.
+    Nodes = fleet × function × nationality. Plus virtual "New Hire" on the left
+    and "Departed" on the right (currently unused but placed for future use).
+    """
+    ss = st.session_state
+
+    # Build node list — source side and destination side are identical, we duplicate
+    # so Plotly Sankey can place them in columns.
+    combos: list[tuple[str, str, str]] = []
+    for f in FLEETS:
+        for fn in FUNCTIONS:
+            for nat in NATIONALITIES:
+                combos.append((f, fn, nat))
+
+    # Source node index = 0..N-1. Destination node index = N..2N-1. Then Hire node.
+    N = len(combos)
+    src_label_of = {combos[i]: i for i in range(N)}
+    dst_label_of = {combos[i]: i + N for i in range(N)}
+    hire_idx_local = 2 * N
+    hire_idx_expat = 2 * N + 1
+
+    labels = [_flow_node_label(*c) + "  (start)" for c in combos] + \
+             [_flow_node_label(*c) + "  (end)" for c in combos] + \
+             ["New Local Hire", "New Expat Hire"]
+
+    # Node colours: fleet colour, darkened by function, lightened by nationality
+    def node_color(combo):
+        f, fn, nat = combo
+        base = _fleet_function_color(f, fn, 0.9 if nat == "Local" else 0.55)
+        return base
+    node_colors = [node_color(c) for c in combos] + \
+                  [node_color(c) for c in combos] + \
+                  ["rgba(22,163,74,0.7)", "rgba(220,38,38,0.55)"]
+
+    # Aggregate pilot flows ------------------------------------------------
+    # Start: every pilot sits on their current fleet/function/nationality node.
+    # Then for each action completed by up_to_month, move them to the new node.
+    flows: dict[tuple[int, int], dict] = {}  # (src, dst) -> {"value": n, "desc": [...]}
+
+    def bump(src, dst, desc):
+        key = (src, dst)
+        if key not in flows:
+            flows[key] = {"value": 0, "desc": []}
+        flows[key]["value"] += 1
+        flows[key]["desc"].append(desc)
+
+    pilot_by_id = {p.employee_id: p for p in ss.pilots}
+
+    # Track each pilot's destination node (starts as source)
+    pilot_dest: dict[str, tuple[str, str, str]] = {
+        p.employee_id: (p.fleet, p.function, p.nationality)
+        for p in ss.pilots if p.fleet in FLEETS
+    }
+
+    # Walk actions that complete on or before up_to_month
+    for a in sorted(ss.actions, key=lambda x: x.start_month):
+        end = a.start_month + a.duration
+        if end > up_to_month + 1:
+            continue
+
+        if a.action_type == "Type Rating":
+            for tid in a.trainee_ids:
+                if tid.startswith("TBD"):
+                    continue
+                p = pilot_by_id.get(tid)
+                if not p or p.fleet not in FLEETS:
+                    continue
+                cur = pilot_dest.get(tid, (p.fleet, p.function, p.nationality))
+                new = (a.to_fleet, a.to_function, p.nationality)
+                if cur != new:
+                    pilot_dest[tid] = new
+
+        elif a.action_type == "Command Upgrade":
+            for tid in a.trainee_ids:
+                if tid.startswith("TBD"):
+                    continue
+                p = pilot_by_id.get(tid)
+                if not p or p.fleet not in FLEETS:
+                    continue
+                cur = pilot_dest.get(tid, (p.fleet, p.function, p.nationality))
+                new = (a.to_fleet, "Captain", p.nationality)
+                if cur != new:
+                    pilot_dest[tid] = new
+
+        elif a.action_type in ("Cadet Hire", "Local Hire"):
+            # New local pilot arriving on destination
+            if a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
+                bump(
+                    hire_idx_local,
+                    dst_label_of[(a.to_fleet, a.to_function, "Local")],
+                    f"Hire: {a.new_pilot_name or 'TBD'}",
+                )
+
+        elif a.action_type == "Expat Hire":
+            if a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
+                bump(
+                    hire_idx_expat,
+                    dst_label_of[(a.to_fleet, a.to_function, "Expat")],
+                    f"Hire: {a.new_pilot_name or 'TBD'}",
+                )
+
+    # Now emit flows for every existing pilot from source -> final destination
+    for pid, dest in pilot_dest.items():
+        p = pilot_by_id.get(pid)
+        if not p or p.fleet not in FLEETS:
+            continue
+        src_combo = (p.fleet, p.function, p.nationality)
+        if src_combo not in src_label_of or dest not in [(*c,) for c in combos]:
+            continue
+        src = src_label_of[src_combo]
+        dst = dst_label_of[dest]
+        bump(src, dst, f"{p.employee_id} — {p.full_name}")
+
+    if not flows:
+        info_panel(
+            "No flows to display — either no actions are planned or all planned "
+            "actions fall after the snapshot month. Try moving the snapshot "
+            "forward or adding more actions."
+        )
+        return
+
+    sources = [k[0] for k in flows.keys()]
+    targets = [k[1] for k in flows.keys()]
+    values = [v["value"] for v in flows.values()]
+    hovers = [
+        f"<b>{labels[k[0]]} → {labels[k[1]]}</b><br>"
+        f"Count: {v['value']}<br>"
+        + "<br>".join(v["desc"][:8])
+        + (f"<br>…and {len(v['desc']) - 8} more" if len(v["desc"]) > 8 else "")
+        for k, v in flows.items()
+    ]
+
+    # Flow colour = source node colour, semi-transparent
+    def _soft(c):
+        if c.startswith("rgba"):
+            parts = c[5:-1].split(",")
+            return f"rgba({parts[0]},{parts[1]},{parts[2]},0.35)"
+        return c
+    link_colors = [_soft(node_colors[s]) for s in sources]
+
+    fig = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(
+            pad=14, thickness=14,
+            line=dict(color=COLORS["border"], width=0.5),
+            label=labels,
+            color=node_colors,
+            hovertemplate="<b>%{label}</b><br>Total: %{value}<extra></extra>",
+        ),
+        link=dict(
+            source=sources, target=targets, value=values,
+            color=link_colors,
+            customdata=hovers,
+            hovertemplate="%{customdata}<extra></extra>",
+        ),
+    ))
+    fig.update_layout(
+        height=680,
+        margin=dict(l=10, r=10, t=20, b=20),
+        font=dict(size=11),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "Read left to right: starting position → ending position at the chosen "
+        "snapshot month. Band thickness = number of pilots. Hover any band for "
+        "the exact pilots involved. Hover any node for the node total."
+    )
+
+
+def _flow_bubble(d):
+    """
+    Bubble chart: x = month, y = localisation % for each fleet × function,
+    bubble size = number of pilots at that fleet × function, colour = gap severity.
+    Animation frames walk through the horizon.
+    """
+    ss = st.session_state
+    frames_data = []
+    fleet_fn_pairs = [(f, fn) for f in FLEETS for fn in FUNCTIONS]
+
+    # Precompute per-month nationality counts from registry + arrivals
+    # For simplicity we only count current registry (no per-month nationality
+    # accounting) — future arrivals are folded in at completion month.
+    pilot_snapshots: dict[int, list] = {m: list(ss.pilots) for m in range(ss.horizon)}
+
+    # Fold hires into later snapshots
+    for m in range(ss.horizon):
+        for a in ss.actions:
+            end = a.start_month + a.duration
+            if end <= m and a.action_type in ("Cadet Hire", "Local Hire", "Expat Hire"):
+                nat = "Local" if a.action_type in ("Cadet Hire", "Local Hire") else "Expat"
+                pilot_snapshots[m].append(
+                    Pilot(
+                        employee_id=f"_virtual_{a.id}",
+                        full_name=a.new_pilot_name or "TBD",
+                        nationality=nat,
+                        fleet=a.to_fleet, function=a.to_function,
+                        designations=[], management=False, status="Active",
+                    )
+                )
+
+    rows = []
+    for m in range(ss.horizon):
+        snap = pilot_snapshots[m]
+        for f, fn in fleet_fn_pairs:
+            group = [p for p in snap if p.fleet == f and p.function == fn]
+            if not group:
+                continue
+            total = len(group)
+            local = sum(1 for p in group if p.nationality == "Local")
+            local_pct = (local / total * 100) if total else 0
+            req = d["req"][f][fn][m]
+            av = d["avail"][f][fn][m]
+            gap = max(0.0, req - av)
+            rows.append({
+                "month_idx": m,
+                "month": d["labels"][m],
+                "fleet_fn": f"{f} {fn[:3]}",
+                "fleet": f,
+                "local_pct": local_pct,
+                "total": total,
+                "req": req,
+                "av": av,
+                "gap": gap,
+                "band": gap_band(gap),
+            })
+
+    if not rows:
+        info_panel("No data to display.")
+        return
+
+    df = pd.DataFrame(rows)
+
+    # Colour map per band
+    band_color = {"green": COLORS["green"], "amber": COLORS["amber"], "red": COLORS["red"]}
+
+    # Build the chart with a slider/animation
+    fig = go.Figure()
+
+    # One trace per month, all invisible except the last; slider controls which
+    frames = []
+    for m in range(ss.horizon):
+        sub = df[df.month_idx == m]
+        if sub.empty:
+            continue
+        frames.append(go.Frame(
+            name=d["labels"][m],
+            data=[go.Scatter(
+                x=sub["local_pct"],
+                y=sub["av"],
+                mode="markers+text",
+                marker=dict(
+                    size=sub["total"] * 3 + 10,
+                    color=[band_color[b] for b in sub["band"]],
+                    line=dict(color=COLORS["navy"], width=1.5),
+                    opacity=0.85,
+                ),
+                text=sub["fleet_fn"],
+                textposition="middle center",
+                textfont=dict(size=9, color="white"),
+                customdata=sub[["fleet_fn", "total", "req", "av", "gap", "local_pct", "month"]].values,
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "Month: %{customdata[6]}<br>"
+                    "Pilots: %{customdata[1]}<br>"
+                    "Required: %{customdata[2]}<br>"
+                    "Available: %{customdata[3]:.1f}<br>"
+                    "Gap: %{customdata[4]:.1f}<br>"
+                    "Local %: %{customdata[5]:.0f}%<extra></extra>"
+                ),
+            )],
+        ))
+
+    if not frames:
+        info_panel("No data to display.")
+        return
+
+    # Initial trace = first frame's data
+    fig.add_trace(frames[0].data[0])
+    fig.frames = frames
+
+    # Slider
+    steps = []
+    for i, fr in enumerate(frames):
+        steps.append(dict(
+            method="animate",
+            label=fr.name,
+            args=[[fr.name], dict(mode="immediate", frame=dict(duration=0, redraw=True),
+                                  transition=dict(duration=250))],
+        ))
+
+    fig.update_layout(
+        height=620,
+        xaxis=dict(title="Localisation %", range=[-5, 105]),
+        yaxis=dict(title="Available pilots"),
+        margin=dict(l=60, r=30, t=40, b=90),
+        sliders=[dict(
+            active=0, currentvalue=dict(prefix="Month: ", font=dict(size=12)),
+            pad=dict(t=30), steps=steps,
+        )],
+        updatemenus=[dict(
+            type="buttons", showactive=False,
+            x=0.02, y=-0.15, xanchor="left", yanchor="top",
+            buttons=[
+                dict(label="▶ Play", method="animate",
+                     args=[None, dict(frame=dict(duration=450, redraw=True),
+                                      fromcurrent=True,
+                                      transition=dict(duration=200))]),
+                dict(label="⏸ Pause", method="animate",
+                     args=[[None], dict(frame=dict(duration=0, redraw=False),
+                                        mode="immediate")]),
+            ],
+        )],
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "Each bubble is a fleet × function. X-axis = localisation %. Y-axis = "
+        "available pilots. Size = total pilots in that group. Colour = gap "
+        "severity (green/amber/red). Hit ▶ Play to watch the plan unfold."
+    )
+
+
+def _flow_network(d, up_to_month: int):
+    """
+    Network graph: fleets as hub nodes, training transitions as edges.
+    Edge thickness = number of pilots taking that route across the plan.
+    Node size = pilots on that fleet at snapshot month.
+    """
+    ss = st.session_state
+
+    # Nodes: one per fleet × function (8 nodes)
+    nodes = []
+    node_idx: dict[tuple[str, str], int] = {}
+    for i, f in enumerate(FLEETS):
+        for j, fn in enumerate(FUNCTIONS):
+            node_idx[(f, fn)] = len(nodes)
+            # Hub-and-spoke layout — fleets around a circle, CPT outer, FO inner
+            import math
+            angle = 2 * math.pi * i / len(FLEETS)
+            radius = 1.0 if fn == "Captain" else 0.55
+            nodes.append({
+                "x": radius * math.cos(angle),
+                "y": radius * math.sin(angle),
+                "label": f"{f}<br>{fn[:3]}",
+                "fleet": f,
+                "function": fn,
+                "size": max(10, d["avail"][f][fn][up_to_month] * 2.2),
+                "req": d["req"][f][fn][up_to_month],
+                "av": d["avail"][f][fn][up_to_month],
+            })
+
+    # Edges: aggregate planned actions into transitions
+    edge_counts: dict[tuple[int, int], int] = {}
+    edge_actions: dict[tuple[int, int], list[str]] = {}
+    for a in ss.actions:
+        if a.start_month + a.duration > up_to_month + 1:
+            continue
+        if a.action_type == "Type Rating":
+            if (a.from_fleet, a.from_function) in node_idx and (a.to_fleet, a.to_function) in node_idx:
+                key = (node_idx[(a.from_fleet, a.from_function)],
+                       node_idx[(a.to_fleet, a.to_function)])
+                edge_counts[key] = edge_counts.get(key, 0) + len(a.trainee_ids)
+                edge_actions.setdefault(key, []).append(
+                    f"TR {a.from_fleet} → {a.to_fleet} at {d['labels'][a.start_month]}"
+                )
+        elif a.action_type == "Command Upgrade":
+            if (a.from_fleet, "First Officer") in node_idx and (a.to_fleet, "Captain") in node_idx:
+                key = (node_idx[(a.from_fleet, "First Officer")],
+                       node_idx[(a.to_fleet, "Captain")])
+                edge_counts[key] = edge_counts.get(key, 0) + len(a.trainee_ids)
+                edge_actions.setdefault(key, []).append(
+                    f"CU {a.from_fleet} → {a.to_fleet} CPT at {d['labels'][a.start_month]}"
+                )
+
+    fig = go.Figure()
+
+    # Edges first (so nodes sit on top)
+    for (src, tgt), count in edge_counts.items():
+        x0, y0 = nodes[src]["x"], nodes[src]["y"]
+        x1, y1 = nodes[tgt]["x"], nodes[tgt]["y"]
+        # Curved line via midpoint offset
+        mx = (x0 + x1) / 2 + (y1 - y0) * 0.15
+        my = (y0 + y1) / 2 - (x1 - x0) * 0.15
+        fig.add_trace(go.Scatter(
+            x=[x0, mx, x1], y=[y0, my, y1],
+            mode="lines",
+            line=dict(color=COLORS["accent"], width=min(12, 2 + count * 1.5)),
+            opacity=0.5, hoverinfo="skip", showlegend=False,
+        ))
+        # Label on midpoint
+        fig.add_trace(go.Scatter(
+            x=[mx], y=[my],
+            mode="markers+text",
+            marker=dict(size=18, color="white",
+                        line=dict(color=COLORS["accent"], width=2)),
+            text=[f"<b>{count}</b>"],
+            textfont=dict(size=10, color=COLORS["navy"]),
+            hovertext="<br>".join(edge_actions[(src, tgt)]),
+            hoverinfo="text", showlegend=False,
+        ))
+
+    # Nodes
+    xs = [n["x"] for n in nodes]
+    ys = [n["y"] for n in nodes]
+    labels = [n["label"] for n in nodes]
+    sizes = [n["size"] for n in nodes]
+    colors = [_fleet_function_color(n["fleet"], n["function"]) for n in nodes]
+    hovers = [
+        f"<b>{n['fleet']} {n['function']}</b><br>"
+        f"Required: {n['req']}<br>Available: {n['av']:.1f}<br>"
+        f"Gap: {max(0, n['req'] - n['av']):.1f}"
+        for n in nodes
+    ]
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="markers+text",
+        marker=dict(size=sizes, color=colors,
+                    line=dict(color="white", width=2)),
+        text=labels, textposition="middle center",
+        textfont=dict(size=10, color="white", family="Inter"),
+        hovertext=hovers, hoverinfo="text", showlegend=False,
+    ))
+
+    fig.update_layout(
+        height=640,
+        xaxis=dict(visible=False, range=[-1.4, 1.4]),
+        yaxis=dict(visible=False, range=[-1.3, 1.3],
+                   scaleanchor="x", scaleratio=1),
+        margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        "Fleets arranged around a circle — Captains on the outer ring, First "
+        "Officers on the inner ring. Node size reflects pilot count at the "
+        "snapshot month. Arrows are pilot transitions; the number in each "
+        "bubble is the cohort size crossing that link by the snapshot."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main — with per-tab crash isolation
 # ---------------------------------------------------------------------------
 def main():
@@ -1658,12 +2270,14 @@ def main():
 
     tabs = st.tabs([
         "📊 Dashboard", "👥 Registry", "✈ Fleet Planner", "📅 Timeline",
-        "🎯 Action Planner", "🌏 Localisation", "🤖 AI Optimiser", "🖨 Print Plan",
+        "🎯 Action Planner", "🌐 Flow Map", "🌏 Localisation",
+        "🤖 AI Optimiser", "🖨 Print Plan",
     ])
 
     tab_funcs = [
         tab_dashboard, tab_registry, tab_fleet_planner, tab_timeline,
-        tab_action_planner, tab_localisation, tab_ai_optimiser, tab_print_plan,
+        tab_action_planner, tab_flow_map, tab_localisation,
+        tab_ai_optimiser, tab_print_plan,
     ]
 
     for tab, fn in zip(tabs, tab_funcs):
