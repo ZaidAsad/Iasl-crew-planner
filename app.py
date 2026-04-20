@@ -992,18 +992,6 @@ def _pilot_picker(label, key, fleet_filter=None, function_filter=None,
 def _form_type_rating(d):
     ss = st.session_state
 
-    # Mode selector — single vs bulk
-    plan_mode = st.radio(
-        "Planning mode",
-        ["Single cohort", "Bulk — repeat across multiple months"],
-        horizontal=True, key="tr_plan_mode",
-        help=(
-            "Single cohort: one action starting at one month. "
-            "Bulk: clone the same action shape across several start months — "
-            "useful when you have 2-3 identical-shape type ratings spaced out."
-        ),
-    )
-
     c1, c2, c3 = st.columns(3)
     with c1:
         from_fleet = st.selectbox("From fleet", FLEETS, key="tr_from_fleet")
@@ -1012,83 +1000,57 @@ def _form_type_rating(d):
     with c3:
         mode = st.selectbox("Mode", ["External", "Internal"], key="tr_mode")
 
-    # Function routing — allow mixed or same-function trainees in one cohort
-    st.markdown("**Trainee routing** (what each trainee's function becomes)")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        route_cpt = st.checkbox(
-            "Include Captain(s): CPT → CPT",
-            value=False, key="tr_route_cpt",
-            help=f"Captains on {from_fleet} transitioning to Captains on {to_fleet}",
-        )
-    with c2:
-        route_fo = st.checkbox(
-            "Include First Officer(s): FO → FO",
-            value=True, key="tr_route_fo",
-            help=f"First Officers on {from_fleet} transitioning to First Officers on {to_fleet}",
-        )
-    with c3:
-        max_total = st.number_input(
-            "Max trainees total (across roles)",
-            min_value=1, max_value=4, value=2,
-            key="tr_max_total",
-            help="Standard cohort is 2. Physically feasible up to 4 for an External course.",
-        )
-
-    if not (route_cpt or route_fo):
-        st.warning("Tick at least one of CPT → CPT or FO → FO.")
-
-    # Duration — suggest by longest route
-    suggested = 1
-    if route_cpt:
-        suggested = max(suggested, _suggest_duration("Type Rating", from_fleet, "Captain", to_fleet, "Captain"))
-    if route_fo:
-        suggested = max(suggested, _suggest_duration("Type Rating", from_fleet, "First Officer", to_fleet, "First Officer"))
-
     c1, c2 = st.columns(2)
     with c1:
-        duration = st.number_input("Duration (months)", 1, 12, suggested, key="tr_dur")
+        start = _month_selector(d, "tr_start")
     with c2:
-        if plan_mode == "Single cohort":
-            start_months = [_month_selector(d, "tr_start")]
-        else:
-            start_months = st.multiselect(
-                "Start months (one action per month)",
-                options=list(range(ss.horizon)),
-                format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}" if i < len(d['labels']) else str(i),
-                key="tr_start_bulk",
-                placeholder="Pick 2 or more months to clone this action into…",
-            )
+        # Duration suggestion — use the longer of the two same-function routes
+        dur_cpt = _suggest_duration("Type Rating", from_fleet, "Captain", to_fleet, "Captain")
+        dur_fo = _suggest_duration("Type Rating", from_fleet, "First Officer", to_fleet, "First Officer")
+        suggested = max(dur_cpt, dur_fo)
+        duration = st.number_input("Duration (months)", 1, 12, suggested, key="tr_dur")
 
-    # Pilot picker sections — one per role, both shown at once
     st.markdown("---")
+    st.markdown(
+        "**Select up to 2 trainees and choose each one's role.** "
+        "Seat Support pilots are off line ops during the course but do NOT "
+        "change fleet or function — useful when a course needs a second seat "
+        "occupant who is not themselves transitioning."
+    )
 
-    cpt_trainees: list[str] = []
-    fo_trainees: list[str] = []
-
-    if route_cpt:
-        st.markdown(f"**Captain trainees** ({from_fleet} → {to_fleet} Captain)")
-        cpt_trainees = _pilot_picker(
-            "Captain trainees", "tr_cpt_trainees",
+    # Trainee 1 -------------------------------------------------------------
+    st.markdown("**Trainee 1**")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        t1_list = _pilot_picker(
+            "Pilot", "tr_t1_pilot",
             fleet_filter=[from_fleet],
-            function_filter=["Captain"],
-            max_selections=max_total,
+            function_filter=["Captain", "First Officer"],
+            max_selections=1,
+        )
+    with c2:
+        t1_role = st.selectbox(
+            "Role",
+            ["Captain → Captain", "First Officer → First Officer", "Seat Support"],
+            key="tr_t1_role",
         )
 
-    if route_fo:
-        st.markdown(f"**First Officer trainees** ({from_fleet} → {to_fleet} First Officer)")
-        fo_trainees = _pilot_picker(
-            "First Officer trainees", "tr_fo_trainees",
+    # Trainee 2 -------------------------------------------------------------
+    st.markdown("**Trainee 2** (optional)")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        t2_list = _pilot_picker(
+            "Pilot", "tr_t2_pilot",
             fleet_filter=[from_fleet],
-            function_filter=["First Officer"],
-            max_selections=max_total,
+            function_filter=["Captain", "First Officer"],
+            max_selections=1,
         )
-
-    total_trainees = len(cpt_trainees) + len(fo_trainees)
-    if total_trainees > max_total:
-        st.warning(
-            f"Selected {total_trainees} trainees but cap is {max_total}. "
-            "Reduce selections or increase the cap above."
+    with c2:
+        t2_role = st.selectbox(
+            "Role",
+            ["— none —", "Captain → Captain",
+             "First Officer → First Officer", "Seat Support"],
+            key="tr_t2_role",
         )
 
     instructor = ""
@@ -1103,51 +1065,109 @@ def _form_type_rating(d):
 
     note = st.text_input("Note (optional)", key="tr_note")
 
-    if st.form_submit_button("Add Type Rating action(s)", type="primary"):
-        if not (route_cpt or route_fo):
-            st.error("Tick at least one routing option.")
-        elif total_trainees == 0:
-            st.error("Select at least one trainee.")
-        elif total_trainees > max_total:
-            st.error(f"Too many trainees ({total_trainees} > {max_total}).")
-        elif plan_mode == "Bulk — repeat across multiple months" and not start_months:
-            st.error("Pick at least one start month for bulk mode.")
-        else:
-            added = 0
-            # If both routes are selected, the cohort is mixed — one action contains
-            # both CPT and FO trainees, but they have different destinations.
-            # Encode by creating TWO actions per start month (one per route) so the
-            # availability math works cleanly. Same action ID prefix groups them.
-            for start in start_months:
-                group_tag = new_id("grp")
+    if st.form_submit_button("Add Type Rating", type="primary"):
+        # Collect trainees with their roles
+        candidates = []
+        if t1_list:
+            candidates.append((t1_list[0], t1_role))
+        if t2_list and t2_role != "— none —":
+            candidates.append((t2_list[0], t2_role))
 
-                if route_cpt and cpt_trainees:
-                    ss.actions.append(PlannedAction(
-                        id=new_id("act"), action_type="Type Rating",
-                        start_month=start, duration=duration, mode=mode,
-                        instructor_id=instructor, trainee_ids=list(cpt_trainees),
-                        from_fleet=from_fleet, from_function="Captain",
-                        to_fleet=to_fleet, to_function="Captain",
-                        note=(note + f"  [cohort {group_tag}]").strip(),
-                    ))
-                    added += 1
+        if not candidates:
+            st.error("Pick at least one trainee.")
+            return
 
-                if route_fo and fo_trainees:
-                    ss.actions.append(PlannedAction(
-                        id=new_id("act"), action_type="Type Rating",
-                        start_month=start, duration=duration, mode=mode,
-                        # Only attach instructor to the first action per cohort so
-                        # the instructor isn't double-counted off line ops.
-                        instructor_id="" if route_cpt else instructor,
-                        trainee_ids=list(fo_trainees),
-                        from_fleet=from_fleet, from_function="First Officer",
-                        to_fleet=to_fleet, to_function="First Officer",
-                        note=(note + f"  [cohort {group_tag}]").strip(),
-                    ))
-                    added += 1
+        # Split into transitioning vs seat support
+        transitioning_cpt: list[str] = []
+        transitioning_fo: list[str] = []
+        seat_support: list[str] = []
+        for pid, role in candidates:
+            if role == "Captain → Captain":
+                transitioning_cpt.append(pid)
+            elif role == "First Officer → First Officer":
+                transitioning_fo.append(pid)
+            elif role == "Seat Support":
+                seat_support.append(pid)
 
-            st.success(f"Added {added} Type Rating action(s) across {len(start_months)} month(s).")
-            st.rerun()
+        # Validate: transitioning pilots must match their role's origin function.
+        # TBD placeholders bypass the check.
+        pilot_by_id = {p.employee_id: p for p in ss.pilots}
+        for pid in transitioning_cpt:
+            if pid.startswith("TBD"):
+                continue
+            p = pilot_by_id.get(pid)
+            if p and p.function != "Captain":
+                st.error(
+                    f"{p.full_name} is a First Officer — cannot assign Captain → Captain role. "
+                    "Switch their role to First Officer → First Officer or Seat Support."
+                )
+                return
+        for pid in transitioning_fo:
+            if pid.startswith("TBD"):
+                continue
+            p = pilot_by_id.get(pid)
+            if p and p.function != "First Officer":
+                st.error(
+                    f"{p.full_name} is a Captain — cannot assign First Officer → First Officer role. "
+                    "Switch their role to Captain → Captain or Seat Support."
+                )
+                return
+
+        # Emit actions. One PlannedAction per destination function so the
+        # availability engine handles routing cleanly. Seat support pilots
+        # are attached to whichever action is created (or a standalone one)
+        # via a dedicated seat_support list encoded in trainee_ids with a
+        # "SEAT:" prefix so they're removed from line ops but not routed.
+        added = 0
+        cohort_tag = new_id("grp")
+
+        if transitioning_cpt:
+            ss.actions.append(PlannedAction(
+                id=new_id("act"), action_type="Type Rating",
+                start_month=start, duration=duration, mode=mode,
+                instructor_id=instructor, trainee_ids=list(transitioning_cpt),
+                from_fleet=from_fleet, from_function="Captain",
+                to_fleet=to_fleet, to_function="Captain",
+                note=(note + f"  [cohort {cohort_tag}]").strip(),
+            ))
+            added += 1
+
+        if transitioning_fo:
+            ss.actions.append(PlannedAction(
+                id=new_id("act"), action_type="Type Rating",
+                start_month=start, duration=duration, mode=mode,
+                # Avoid double-counting instructor if both CPT and FO actions are created
+                instructor_id="" if transitioning_cpt else instructor,
+                trainee_ids=list(transitioning_fo),
+                from_fleet=from_fleet, from_function="First Officer",
+                to_fleet=to_fleet, to_function="First Officer",
+                note=(note + f"  [cohort {cohort_tag}]").strip(),
+            ))
+            added += 1
+
+        # Seat-support-only action (no transitioning pilots)
+        if seat_support and not (transitioning_cpt or transitioning_fo):
+            ss.actions.append(PlannedAction(
+                id=new_id("act"), action_type="Type Rating",
+                start_month=start, duration=duration, mode=mode,
+                instructor_id=instructor,
+                trainee_ids=[f"SEAT:{pid}" for pid in seat_support],
+                from_fleet=from_fleet, from_function="",
+                to_fleet=to_fleet, to_function="",
+                note=(note + f"  [seat support only, cohort {cohort_tag}]").strip(),
+            ))
+            added += 1
+        elif seat_support:
+            # Attach seat-support pilots to the first emitted action so their
+            # unavailability is recorded without altering their destination.
+            # Find the most recent cohort action and append SEAT: entries.
+            for act in reversed(ss.actions):
+                if f"cohort {cohort_tag}" in act.note:
+                    act.trainee_ids = list(act.trainee_ids) + [f"SEAT:{pid}" for pid in seat_support]
+                    break
+
+        st.success(f"Added {added} Type Rating action(s).")
+        st.rerun()
 
 
 def _form_command_upgrade(d):
