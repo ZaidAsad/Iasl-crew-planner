@@ -45,10 +45,8 @@ TRAINING_DURATIONS = {
     "cadet_atr_fo":                   2,
     "command_upgrade_same_fleet":     1,
     "a330_fo_to_a320_captain":        1 + 1,  # type rating + command = 2
-    # Note on the above: the rule said 1.5; we encode as 2 integer months since
-    # the planner operates in month granularity. The 1.5 claim in the spec
-    # assumed fractional months; we round up so no pilot is shown available
-    # during a period they are still in training. Documented here for clarity.
+    # Note: spec said 1.5 months; engine operates in whole months, so we
+    # round up to 2 to avoid showing a pilot available while still training.
 }
 
 ACTION_TYPES = [
@@ -59,6 +57,26 @@ ACTION_TYPES = [
     "Local Hire",
     "Fleet Change",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Seat Support handling
+# ---------------------------------------------------------------------------
+# Seat Support pilots accompany a Type Rating course without themselves
+# transitioning fleets or functions. They're encoded inside PlannedAction.trainee_ids
+# with the prefix "SEAT:", e.g. "SEAT:L042". The underlying pilot is still
+# off line ops for the duration (so _pilot_unavailable_during_action catches
+# them), but the availability post-arrival routing skips them (so they don't
+# move fleets). This keeps the dataclass schema backwards-compatible with any
+# JSON files saved before this feature existed.
+SEAT_PREFIX = "SEAT:"
+
+
+def _strip_seat(tid: str) -> tuple[bool, str]:
+    """Return (is_seat_support, underlying_pilot_id)."""
+    if tid.startswith(SEAT_PREFIX):
+        return True, tid[len(SEAT_PREFIX):]
+    return False, tid
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +122,10 @@ class PlannedAction:
     duration: int              # months; for hires it is the training lag, 0 for instant
     mode: str = "External"     # External | Internal (for Type Rating / Command Upgrade)
     instructor_id: str = ""    # pilot employee_id, or "" or "TBD"
-    trainee_ids: list[str] = field(default_factory=list)  # up to 2 (TBD allowed as literal "TBD-n")
+    trainee_ids: list[str] = field(default_factory=list)
+    # Trainee IDs may carry the "SEAT:" prefix to mark seat-support pilots
+    # who are off line ops for the duration but do not change fleet/function.
+    # TBD placeholders (TBD-1, TBD-2) are supported here too.
     from_fleet: str = ""
     from_function: str = ""
     to_fleet: str = ""
@@ -143,7 +164,6 @@ def resolve_aircraft_counts(
     A change on month M applies from month M onward.
     """
     out = {f: [initial.get(f, 0)] * horizon for f in FLEETS}
-    # Sort changes by month
     for ch in sorted(changes, key=lambda c: c.month_index):
         if ch.fleet not in out:
             continue
@@ -177,13 +197,27 @@ def _action_occupies(action: PlannedAction, month_idx: int) -> bool:
 
 
 def _pilot_unavailable_during_action(action: PlannedAction, pilot_id: str) -> bool:
-    """Does this action take this pilot off line ops during its duration?"""
-    if action.action_type in ("Type Rating", "Command Upgrade"):
-        # Instructor (internal mode only) and trainees are unavailable
-        if action.mode == "Internal" and action.instructor_id == pilot_id:
-            return True
-        if pilot_id in action.trainee_ids:
-            return True
+    """
+    Does this action take this pilot off line ops during its duration?
+    Covers:
+      - Internal-mode instructor
+      - Named trainees (direct match)
+      - Seat Support pilots (stored with SEAT: prefix in trainee_ids)
+    """
+    if action.action_type not in ("Type Rating", "Command Upgrade"):
+        return False
+
+    if action.mode == "Internal" and action.instructor_id == pilot_id:
+        return True
+
+    # Direct trainee match
+    if pilot_id in action.trainee_ids:
+        return True
+
+    # Seat Support match
+    if f"{SEAT_PREFIX}{pilot_id}" in action.trainee_ids:
+        return True
+
     return False
 
 
@@ -193,17 +227,19 @@ def compute_availability(
     horizon: int,
 ) -> dict[str, dict[str, list[float]]]:
     """
-    Returns { fleet: {"Captain": [..], "First Officer": [..]} } of summed contributions
-    per month, honouring:
+    Returns { fleet: {"Captain": [..], "First Officer": [..]} } of summed
+    contributions per month, honouring:
       - Management pilot 0.5 factor
       - On Type Rating / On Leave pilots contributing 0
-      - Trainees and (Internal) instructors removed from their source fleet during action
-      - Trainees who complete a Type Rating or Command Upgrade arrive on the destination
-        fleet / function from the month the action ends onward
-      - Hires (Cadet / Expat / Local) arrive on the destination fleet after their lag
+      - Trainees and (Internal) instructors removed from their source fleet
+        during the action window
+      - Seat Support pilots removed from source fleet during the action, but
+        NOT routed to any destination afterwards (they return to origin)
+      - Trainees who complete a Type Rating or Command Upgrade arrive on the
+        destination fleet/function from the month the action ends onward
+      - Hires (Cadet / Expat / Local) arrive on the destination fleet after
+        their training lag
     """
-    # Bootstrap: current fleet/function mapping from the registry.
-    # For actions in progress, we override month by month.
     avail: dict[str, dict[str, list[float]]] = {
         f: {"Captain": [0.0] * horizon, "First Officer": [0.0] * horizon} for f in FLEETS
     }
@@ -211,14 +247,13 @@ def compute_availability(
     by_id = {p.employee_id: p for p in pilots}
 
     for month in range(horizon):
-        # Start from registry contribution for each pilot
+        # Baseline: registry contribution for each pilot
         for p in pilots:
             if not p.fleet or p.fleet not in FLEETS:
                 continue
             c = p.contribution()
             if c == 0:
                 continue
-            # Check if any action has this pilot off line ops this month
             off = False
             for a in actions:
                 if _action_occupies(a, month) and _pilot_unavailable_during_action(a, p.employee_id):
@@ -235,21 +270,27 @@ def compute_availability(
                 continue  # not yet arrived
 
             if a.action_type == "Type Rating":
-                # Trainees move to to_fleet/to_function at month `end`
                 for tid in a.trainee_ids:
-                    if tid.startswith("TBD"):
-                        # Treat TBD trainee as 1.0 contribution (placeholder) from `end`
+                    is_seat, real_id = _strip_seat(tid)
+
+                    # Seat Support pilots do not change fleet/function.
+                    # They return to their registry seat automatically via
+                    # the baseline loop above (since from `end` onward the
+                    # action is no longer occupying them), so we skip here.
+                    if is_seat:
+                        continue
+
+                    if real_id.startswith("TBD"):
                         if a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
                             avail[a.to_fleet][a.to_function][month] += 1.0
                     else:
-                        # Remove original-fleet contribution we already added, then add destination
-                        p = by_id.get(tid)
+                        p = by_id.get(real_id)
                         if p is None:
                             continue
                         c = 0.5 if p.management else 1.0
                         if p.status != "Active":
                             c = 0.0
-                        # Subtract from original fleet (we added it above)
+                        # Subtract from original fleet (we added it in baseline)
                         if p.fleet in FLEETS:
                             avail[p.fleet][p.function][month] -= c
                         # Add to destination
@@ -257,32 +298,35 @@ def compute_availability(
                             avail[a.to_fleet][a.to_function][month] += c
 
             elif a.action_type == "Command Upgrade":
-                # Trainees move from FO to Captain on same or destination fleet
                 for tid in a.trainee_ids:
-                    if tid.startswith("TBD"):
+                    is_seat, real_id = _strip_seat(tid)
+                    if is_seat:
+                        # Seat support on a command upgrade is unusual but
+                        # handled symmetrically — return to origin, no route.
+                        continue
+
+                    if real_id.startswith("TBD"):
                         if a.to_fleet in FLEETS:
                             avail[a.to_fleet]["Captain"][month] += 1.0
                     else:
-                        p = by_id.get(tid)
+                        p = by_id.get(real_id)
                         if p is None:
                             continue
                         c = 0.5 if p.management else 1.0
                         if p.status != "Active":
                             c = 0.0
-                        # Subtract original contribution (FO on from_fleet or their current fleet)
                         if p.fleet in FLEETS:
                             avail[p.fleet][p.function][month] -= c
                         if a.to_fleet in FLEETS:
                             avail[a.to_fleet]["Captain"][month] += c
 
             elif a.action_type in ("Cadet Hire", "Expat Hire", "Local Hire"):
-                # New arrival appears on destination fleet / function
                 if a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
                     avail[a.to_fleet][a.to_function][month] += 1.0
 
-    # Never allow negative availability (can happen if a pilot is listed on a fleet
-    # but also moved by an action whose end we passed — the subtract/add logic can
-    # momentarily go negative if the pilot's listed fleet is already the destination).
+    # Clamp to non-negative — protects against edge cases where a pilot's
+    # listed fleet equals their destination fleet and the subtract/add
+    # cycle briefly goes negative.
     for f in avail:
         for fn in avail[f]:
             avail[f][fn] = [max(0.0, v) for v in avail[f][fn]]
@@ -323,18 +367,25 @@ def detect_conflicts(actions: list[PlannedAction]) -> list[dict[str, Any]]:
     Return a list of conflict records: {pilot_id, actions: [id, id], reason}.
     A conflict = the same named pilot (not TBD) assigned to overlapping actions
     where both actions would remove them from line ops.
+    Seat Support entries (SEAT: prefix) are normalised so a seat-support
+    booking collides with a training booking for the same pilot.
     """
     conflicts: list[dict[str, Any]] = []
-    # Gather per-pilot action windows
     pilot_windows: dict[str, list[tuple[PlannedAction, int, int]]] = {}
+
     for a in actions:
         involved: list[str] = []
         if a.action_type in ("Type Rating", "Command Upgrade"):
             if a.mode == "Internal" and a.instructor_id and not a.instructor_id.startswith("TBD"):
                 involved.append(a.instructor_id)
             for tid in a.trainee_ids:
-                if tid and not tid.startswith("TBD"):
-                    involved.append(tid)
+                if not tid:
+                    continue
+                _is_seat, real_id = _strip_seat(tid)
+                if real_id.startswith("TBD"):
+                    continue
+                involved.append(real_id)
+
         for pid in involved:
             pilot_windows.setdefault(pid, []).append(
                 (a, a.start_month, a.start_month + a.duration)
@@ -386,43 +437,49 @@ def build_cascade_graph(
     end = action.start_month + action.duration
 
     if action.action_type == "Command Upgrade":
-        # Root: the upgrade itself
         add_node("root", f"Command Upgrade\n{action.from_fleet} → {action.to_fleet} CPT",
                  "trigger", start)
 
-        # Trainees become Captains
         for i, tid in enumerate(action.trainee_ids):
-            name = "TBD" if tid.startswith("TBD") else by_id.get(tid, Pilot(
-                tid, tid, "", "", "", [], False, "Active")).full_name
+            is_seat, real_id = _strip_seat(tid)
+            name = "TBD" if real_id.startswith("TBD") else by_id.get(real_id, Pilot(
+                real_id, real_id, "", "", "", [], False, "Active")).full_name
+
+            if is_seat:
+                # Seat support on a command upgrade — returns to origin
+                sid = f"seat_{i}"
+                back_label = f"{name}\nseat support ({action.duration}mo)\nreturns to origin"
+                add_node(sid, back_label, "training", start)
+                add_edge("root", sid)
+                continue
+
             tn = f"cap_{i}"
             add_node(tn, f"{name}\nnew {action.to_fleet} Captain", "arrival", end)
             add_edge("root", tn, f"+{action.duration}mo training")
 
-            # Slot opens on the trainee's origin fleet + FO
             slot_id = f"slot_{i}"
-            origin = action.from_fleet or (by_id[tid].fleet if tid in by_id else "")
+            origin = action.from_fleet or (by_id[real_id].fleet if real_id in by_id else "")
             add_node(slot_id, f"FO slot opens\n{origin}", "slot", start)
             add_edge(tn, slot_id, "vacates FO seat")
 
-            # Look for a downstream action that fills this slot:
-            # a Type Rating arriving on this origin/FO after `start`, OR a Cadet/Local/Expat Hire
             filled = False
             for a2 in all_actions:
                 if a2.id == action.id:
                     continue
                 if a2.action_type == "Type Rating" and a2.to_fleet == origin and a2.to_function == "First Officer":
                     if a2.start_month >= start:
-                        # Training box
                         tr_id = f"tr_{i}_{a2.id}"
                         add_node(tr_id, f"Type Rating {a2.from_fleet}→{origin}\n"
                                         f"{a2.duration}mo",
                                  "training", a2.start_month)
                         add_edge(slot_id, tr_id, "feeder move")
-                        # Arrival
                         ar_id = f"ar_{i}_{a2.id}"
-                        names = ", ".join("TBD" if t.startswith("TBD")
-                                          else (by_id[t].full_name if t in by_id else t)
-                                          for t in a2.trainee_ids)
+                        names = ", ".join(
+                            "TBD" if _strip_seat(t)[1].startswith("TBD")
+                            else (by_id[_strip_seat(t)[1]].full_name
+                                  if _strip_seat(t)[1] in by_id else _strip_seat(t)[1])
+                            for t in a2.trainee_ids if not _strip_seat(t)[0]
+                        )
                         add_node(ar_id, f"{names}\nactive {origin} FO",
                                  "arrival", a2.start_month + a2.duration)
                         add_edge(tr_id, ar_id, f"arrives {a2.start_month + a2.duration}")
@@ -450,22 +507,35 @@ def build_cascade_graph(
         add_node("root", f"Type Rating\n{action.from_fleet} {action.from_function} → "
                          f"{action.to_fleet} {action.to_function}", "trigger", start)
         for i, tid in enumerate(action.trainee_ids):
-            name = "TBD" if tid.startswith("TBD") else by_id.get(tid, Pilot(
-                tid, tid, "", "", "", [], False, "Active")).full_name
+            is_seat, real_id = _strip_seat(tid)
+            name = "TBD" if real_id.startswith("TBD") else by_id.get(real_id, Pilot(
+                real_id, real_id, "", "", "", [], False, "Active")).full_name
+
             tr_id = f"tr_{i}"
-            add_node(tr_id, f"{name}\nin training ({action.duration}mo)",
-                     "training", start)
+            label = f"{name}\n{'seat support' if is_seat else 'in training'} ({action.duration}mo)"
+            add_node(tr_id, label, "training", start)
             add_edge("root", tr_id)
-            ar_id = f"ar_{i}"
-            add_node(ar_id, f"{name}\nactive {action.to_fleet} {action.to_function}",
-                     "arrival", end)
-            add_edge(tr_id, ar_id, f"arrives {end}")
-            # Backfill slot on origin
-            if action.from_fleet and action.from_function:
-                slot_id = f"slot_{i}"
-                add_node(slot_id, f"{action.from_fleet} {action.from_function}\nslot opens",
-                         "slot", start)
-                add_edge(tr_id, slot_id, "vacates origin")
+
+            if is_seat:
+                # Seat support returns to original role — no routing, no slot
+                back_id = f"back_{i}"
+                if real_id in by_id:
+                    p = by_id[real_id]
+                    back_label = f"{name}\nreturns to {p.fleet} {p.function}"
+                else:
+                    back_label = f"{name}\nreturns to original role"
+                add_node(back_id, back_label, "arrival", end)
+                add_edge(tr_id, back_id, f"returns {end}")
+            else:
+                ar_id = f"ar_{i}"
+                add_node(ar_id, f"{name}\nactive {action.to_fleet} {action.to_function}",
+                         "arrival", end)
+                add_edge(tr_id, ar_id, f"arrives {end}")
+                if action.from_fleet and action.from_function:
+                    slot_id = f"slot_{i}"
+                    add_node(slot_id, f"{action.from_fleet} {action.from_function}\nslot opens",
+                             "slot", start)
+                    add_edge(tr_id, slot_id, "vacates origin")
 
     elif action.action_type in ("Cadet Hire", "Local Hire", "Expat Hire"):
         add_node("root", f"{action.action_type}\n{action.new_pilot_name or 'TBD'}",
@@ -520,7 +590,6 @@ def eligible_feeders_for(expat: Pilot, pilots: list[Pilot]) -> list[dict[str, An
             "route": route,
             "duration_months": duration,
         })
-    # Sort shortest route first
     candidates.sort(key=lambda c: c["duration_months"])
     return candidates
 
@@ -529,31 +598,24 @@ def _training_route(pilot: Pilot, to_fleet: str, to_function: str) -> tuple[str 
     """Return (human-readable route, duration in months) or (None, 0) if infeasible."""
     f, fn = pilot.fleet, pilot.function
 
-    # Same fleet same function: not a localisation candidate
     if f == to_fleet and fn == to_function:
         return None, 0
 
-    # Same fleet, FO → Captain: command upgrade only
     if f == to_fleet and fn == "First Officer" and to_function == "Captain":
         return f"Command Upgrade on {f}", TRAINING_DURATIONS["command_upgrade_same_fleet"]
 
-    # DHC-8 → ATR same function
     if f == "DHC8" and to_fleet == "ATR72" and fn == to_function:
         return "Type Rating DHC-8 → ATR72", TRAINING_DURATIONS["type_rating_dhc8_to_atr"]
 
-    # ATR/DHC8 Captain or FO → A320 FO
     if f in ("ATR72", "DHC8") and to_fleet == "A320" and to_function == "First Officer":
         return f"Type Rating {f} → A320 FO", TRAINING_DURATIONS["type_rating_any_to_a320_fo"]
 
-    # A320 FO → A330 FO
     if f == "A320" and fn == "First Officer" and to_fleet == "A330" and to_function == "First Officer":
         return "Type Rating A320 FO → A330 FO", TRAINING_DURATIONS["type_rating_a320_fo_to_a330_fo"]
 
-    # A330 FO → A320 Captain (type rating + command)
     if f == "A330" and fn == "First Officer" and to_fleet == "A320" and to_function == "Captain":
         return "Type Rating A330 FO → A320 FO + Command Upgrade", TRAINING_DURATIONS["a330_fo_to_a320_captain"]
 
-    # A320 Captain → A330 Captain via A330 FO command upgrade
     if f == "A320" and fn == "Captain" and to_fleet == "A330" and to_function == "Captain":
         return "Command Upgrade path (A320 CPT candidate for A330 CPT)", 1
 
