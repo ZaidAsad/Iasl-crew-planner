@@ -1004,18 +1004,20 @@ def _form_type_rating(d):
     with c1:
         start = _month_selector(d, "tr_start")
     with c2:
-        # Duration suggestion — use the longer of the two same-function routes
-        dur_cpt = _suggest_duration("Type Rating", from_fleet, "Captain", to_fleet, "Captain")
-        dur_fo = _suggest_duration("Type Rating", from_fleet, "First Officer", to_fleet, "First Officer")
-        suggested = max(dur_cpt, dur_fo)
+        # Duration suggestion — take the longest route across the three possible options
+        dur_cpt_cpt = _suggest_duration("Type Rating", from_fleet, "Captain", to_fleet, "Captain")
+        dur_fo_fo = _suggest_duration("Type Rating", from_fleet, "First Officer", to_fleet, "First Officer")
+        dur_cpt_fo = _suggest_duration("Type Rating", from_fleet, "Captain", to_fleet, "First Officer")
+        suggested = max(dur_cpt_cpt, dur_fo_fo, dur_cpt_fo)
         duration = st.number_input("Duration (months)", 1, 12, suggested, key="tr_dur")
 
     st.markdown("---")
     st.markdown(
         "**Select up to 2 trainees and choose each one's role.** "
-        "Seat Support pilots are off line ops during the course but do NOT "
-        "change fleet or function — useful when a course needs a second seat "
-        "occupant who is not themselves transitioning."
+        "A Captain may transition to Captain on the destination fleet, OR "
+        "downgrade to First Officer on the destination fleet (common when a "
+        "DHC-8 / ATR Captain moves to a larger fleet as FO first). "
+        "Seat Support pilots are off line ops for the course but do not change fleet or function."
     )
 
     # Trainee 1 -------------------------------------------------------------
@@ -1031,7 +1033,10 @@ def _form_type_rating(d):
     with c2:
         t1_role = st.selectbox(
             "Role",
-            ["Captain → Captain", "First Officer → First Officer", "Seat Support"],
+            ["Captain → Captain",
+             "Captain → First Officer",
+             "First Officer → First Officer",
+             "Seat Support"],
             key="tr_t1_role",
         )
 
@@ -1048,8 +1053,11 @@ def _form_type_rating(d):
     with c2:
         t2_role = st.selectbox(
             "Role",
-            ["— none —", "Captain → Captain",
-             "First Officer → First Officer", "Seat Support"],
+            ["— none —",
+             "Captain → Captain",
+             "Captain → First Officer",
+             "First Officer → First Officer",
+             "Seat Support"],
             key="tr_t2_role",
         )
 
@@ -1066,7 +1074,6 @@ def _form_type_rating(d):
     note = st.text_input("Note (optional)", key="tr_note")
 
     if st.form_submit_button("Add Type Rating", type="primary"):
-        # Collect trainees with their roles
         candidates = []
         if t1_list:
             candidates.append((t1_list[0], t1_role))
@@ -1077,94 +1084,78 @@ def _form_type_rating(d):
             st.error("Pick at least one trainee.")
             return
 
-        # Split into transitioning vs seat support
-        transitioning_cpt: list[str] = []
-        transitioning_fo: list[str] = []
-        seat_support: list[str] = []
-        for pid, role in candidates:
-            if role == "Captain → Captain":
-                transitioning_cpt.append(pid)
-            elif role == "First Officer → First Officer":
-                transitioning_fo.append(pid)
-            elif role == "Seat Support":
-                seat_support.append(pid)
-
-        # Validate: transitioning pilots must match their role's origin function.
-        # TBD placeholders bypass the check.
+        # Validate origin function matches the role's "From" side (TBD bypasses)
         pilot_by_id = {p.employee_id: p for p in ss.pilots}
-        for pid in transitioning_cpt:
-            if pid.startswith("TBD"):
+        for pid, role in candidates:
+            if pid.startswith("TBD") or role == "Seat Support":
                 continue
             p = pilot_by_id.get(pid)
-            if p and p.function != "Captain":
+            if not p:
+                continue
+            if role.startswith("Captain →") and p.function != "Captain":
                 st.error(
-                    f"{p.full_name} is a First Officer — cannot assign Captain → Captain role. "
+                    f"{p.full_name} is a First Officer — cannot assign '{role}'. "
                     "Switch their role to First Officer → First Officer or Seat Support."
                 )
                 return
-        for pid in transitioning_fo:
-            if pid.startswith("TBD"):
-                continue
-            p = pilot_by_id.get(pid)
-            if p and p.function != "First Officer":
+            if role.startswith("First Officer →") and p.function != "First Officer":
                 st.error(
-                    f"{p.full_name} is a Captain — cannot assign First Officer → First Officer role. "
-                    "Switch their role to Captain → Captain or Seat Support."
+                    f"{p.full_name} is a Captain — cannot assign '{role}'. "
+                    "Switch their role to Captain → Captain, Captain → First Officer, or Seat Support."
                 )
                 return
 
-        # Emit actions. One PlannedAction per destination function so the
-        # availability engine handles routing cleanly. Seat support pilots
-        # are attached to whichever action is created (or a standalone one)
-        # via a dedicated seat_support list encoded in trainee_ids with a
-        # "SEAT:" prefix so they're removed from line ops but not routed.
-        added = 0
+        # Group by (from_function, to_function) tuple — one PlannedAction per group
+        groups: dict[tuple[str, str], list[str]] = {}
+        seat_support: list[str] = []
+        for pid, role in candidates:
+            if role == "Captain → Captain":
+                groups.setdefault(("Captain", "Captain"), []).append(pid)
+            elif role == "Captain → First Officer":
+                groups.setdefault(("Captain", "First Officer"), []).append(pid)
+            elif role == "First Officer → First Officer":
+                groups.setdefault(("First Officer", "First Officer"), []).append(pid)
+            elif role == "Seat Support":
+                seat_support.append(pid)
+
         cohort_tag = new_id("grp")
+        added = 0
+        first_action_emitted = False
 
-        if transitioning_cpt:
+        for (from_fn, to_fn), trainees in groups.items():
             ss.actions.append(PlannedAction(
                 id=new_id("act"), action_type="Type Rating",
                 start_month=start, duration=duration, mode=mode,
-                instructor_id=instructor, trainee_ids=list(transitioning_cpt),
-                from_fleet=from_fleet, from_function="Captain",
-                to_fleet=to_fleet, to_function="Captain",
+                # Attach instructor only to the first emitted action so the
+                # instructor is not double-counted off line ops across actions.
+                instructor_id="" if first_action_emitted else instructor,
+                trainee_ids=list(trainees),
+                from_fleet=from_fleet, from_function=from_fn,
+                to_fleet=to_fleet, to_function=to_fn,
                 note=(note + f"  [cohort {cohort_tag}]").strip(),
             ))
+            first_action_emitted = True
             added += 1
 
-        if transitioning_fo:
-            ss.actions.append(PlannedAction(
-                id=new_id("act"), action_type="Type Rating",
-                start_month=start, duration=duration, mode=mode,
-                # Avoid double-counting instructor if both CPT and FO actions are created
-                instructor_id="" if transitioning_cpt else instructor,
-                trainee_ids=list(transitioning_fo),
-                from_fleet=from_fleet, from_function="First Officer",
-                to_fleet=to_fleet, to_function="First Officer",
-                note=(note + f"  [cohort {cohort_tag}]").strip(),
-            ))
-            added += 1
-
-        # Seat-support-only action (no transitioning pilots)
-        if seat_support and not (transitioning_cpt or transitioning_fo):
-            ss.actions.append(PlannedAction(
-                id=new_id("act"), action_type="Type Rating",
-                start_month=start, duration=duration, mode=mode,
-                instructor_id=instructor,
-                trainee_ids=[f"SEAT:{pid}" for pid in seat_support],
-                from_fleet=from_fleet, from_function="",
-                to_fleet=to_fleet, to_function="",
-                note=(note + f"  [seat support only, cohort {cohort_tag}]").strip(),
-            ))
-            added += 1
-        elif seat_support:
-            # Attach seat-support pilots to the first emitted action so their
-            # unavailability is recorded without altering their destination.
-            # Find the most recent cohort action and append SEAT: entries.
-            for act in reversed(ss.actions):
-                if f"cohort {cohort_tag}" in act.note:
-                    act.trainee_ids = list(act.trainee_ids) + [f"SEAT:{pid}" for pid in seat_support]
-                    break
+        if seat_support:
+            if first_action_emitted:
+                # Append SEAT: entries to the first cohort action we just emitted
+                for act in reversed(ss.actions):
+                    if f"cohort {cohort_tag}" in act.note:
+                        act.trainee_ids = list(act.trainee_ids) + [f"SEAT:{pid}" for pid in seat_support]
+                        break
+            else:
+                # Seat-support-only action (rare but supported)
+                ss.actions.append(PlannedAction(
+                    id=new_id("act"), action_type="Type Rating",
+                    start_month=start, duration=duration, mode=mode,
+                    instructor_id=instructor,
+                    trainee_ids=[f"SEAT:{pid}" for pid in seat_support],
+                    from_fleet=from_fleet, from_function="",
+                    to_fleet=to_fleet, to_function="",
+                    note=(note + f"  [seat support only, cohort {cohort_tag}]").strip(),
+                ))
+                added += 1
 
         st.success(f"Added {added} Type Rating action(s).")
         st.rerun()
@@ -1287,14 +1278,25 @@ def _form_fleet_change(d):
 
 def _suggest_duration(action_type, from_fleet, from_func, to_fleet, to_func) -> int:
     if action_type == "Type Rating":
+        # Same-function DHC-8 → ATR
         if from_fleet == "DHC8" and to_fleet == "ATR72" and from_func == to_func:
             return TRAINING_DURATIONS["type_rating_dhc8_to_atr"]
+        # Anything (Cpt or FO) from ATR/DHC8 → A320 FO
         if to_fleet == "A320" and to_func == "First Officer" and from_fleet in ("ATR72", "DHC8"):
             return TRAINING_DURATIONS["type_rating_any_to_a320_fo"]
+        # A320 FO → A330 FO
         if (from_fleet == "A320" and from_func == "First Officer"
                 and to_fleet == "A330" and to_func == "First Officer"):
             return TRAINING_DURATIONS["type_rating_a320_fo_to_a330_fo"]
-        return 2
+        # A320 Captain → A330 First Officer (downgrade route)
+        if (from_fleet == "A320" and from_func == "Captain"
+                and to_fleet == "A330" and to_func == "First Officer"):
+            return TRAINING_DURATIONS["type_rating_a320_fo_to_a330_fo"]
+        # ATR/DHC8 Captain → A330 First Officer (rare but legitimate)
+        if (from_fleet in ("ATR72", "DHC8") and from_func == "Captain"
+                and to_fleet == "A330" and to_func == "First Officer"):
+            return TRAINING_DURATIONS["type_rating_any_to_a320_fo"]
+        return 2  # generic fallback
     return 1
 
 
@@ -1840,61 +1842,102 @@ def _flow_node_label(fleet: str, function: str, nationality: str) -> str:
 def _flow_sankey(d, up_to_month: int):
     """
     Sankey of pilot flows from month 0 (current registry state) to end of the
-    selected snapshot month, following planned actions.
-    Nodes = fleet × function × nationality. Plus virtual "New Hire" on the left
-    and "Departed" on the right (currently unused but placed for future use).
+    selected snapshot month. Filterable by fleet, function, and nationality.
+    Uses clean node naming and higher-contrast flow colours keyed on source
+    fleet so a viewer's eye can follow a single fleet's transitions.
     """
     ss = st.session_state
 
-    # Build node list — source side and destination side are identical, we duplicate
-    # so Plotly Sankey can place them in columns.
+    # ---- Filters ----------------------------------------------------------
+    st.markdown("**Filters**")
+    fc1, fc2, fc3, fc4 = st.columns(4)
+    with fc1:
+        filt_fleets = st.multiselect(
+            "Show flows touching fleets",
+            options=FLEETS, default=FLEETS, key="fm_sk_fleets",
+            help="A flow is shown if EITHER its origin or destination fleet is in this set.",
+        )
+    with fc2:
+        filt_funcs = st.multiselect(
+            "Show flows touching functions",
+            options=FUNCTIONS, default=FUNCTIONS, key="fm_sk_funcs",
+        )
+    with fc3:
+        filt_nats = st.multiselect(
+            "Show flows by nationality",
+            options=NATIONALITIES, default=NATIONALITIES, key="fm_sk_nats",
+        )
+    with fc4:
+        show_static = st.checkbox(
+            "Hide non-movers",
+            value=True, key="fm_sk_hide_static",
+            help="A non-mover is a pilot whose position hasn't changed by the snapshot. "
+                 "Hiding them declutters the diagram.",
+        )
+
+    # ---- Build node list --------------------------------------------------
     combos: list[tuple[str, str, str]] = []
     for f in FLEETS:
         for fn in FUNCTIONS:
             for nat in NATIONALITIES:
                 combos.append((f, fn, nat))
 
-    # Source node index = 0..N-1. Destination node index = N..2N-1. Then Hire node.
     N = len(combos)
-    src_label_of = {combos[i]: i for i in range(N)}
-    dst_label_of = {combos[i]: i + N for i in range(N)}
-    hire_idx_local = 2 * N
-    hire_idx_expat = 2 * N + 1
+    src_idx = {combos[i]: i for i in range(N)}
+    dst_idx = {combos[i]: i + N for i in range(N)}
+    hire_local_idx = 2 * N
+    hire_expat_idx = 2 * N + 1
 
-    labels = [_flow_node_label(*c) + "  (start)" for c in combos] + \
-             [_flow_node_label(*c) + "  (end)" for c in combos] + \
-             ["New Local Hire", "New Expat Hire"]
-
-    # Node colours: fleet colour, darkened by function, lightened by nationality
-    def node_color(combo):
+    # ---- Better node labels ----------------------------------------------
+    def _node_label(combo: tuple[str, str, str], suffix: str) -> str:
         f, fn, nat = combo
-        base = _fleet_function_color(f, fn, 0.9 if nat == "Local" else 0.55)
-        return base
-    node_colors = [node_color(c) for c in combos] + \
-                  [node_color(c) for c in combos] + \
-                  ["rgba(22,163,74,0.7)", "rgba(220,38,38,0.55)"]
+        fn_short = "CPT" if fn == "Captain" else "FO"
+        nat_short = "LOC" if nat == "Local" else "EXP"
+        return f"{f}  {fn_short}  {nat_short}   {suffix}"
 
-    # Aggregate pilot flows ------------------------------------------------
-    # Start: every pilot sits on their current fleet/function/nationality node.
-    # Then for each action completed by up_to_month, move them to the new node.
-    flows: dict[tuple[int, int], dict] = {}  # (src, dst) -> {"value": n, "desc": [...]}
+    labels = (
+        [_node_label(c, "start") for c in combos]
+        + [_node_label(c, "end  ") for c in combos]
+        + ["New hire — Local", "New hire — Expat"]
+    )
 
-    def bump(src, dst, desc):
+    # ---- Node colours -----------------------------------------------------
+    # Solid fleet colour per node, with function and nationality
+    # encoded by brightness (CPT darker, Expat lighter).
+    def _node_color(combo: tuple[str, str, str]) -> str:
+        f, fn, nat = combo
+        alpha = 0.95 if nat == "Local" else 0.60
+        return _fleet_function_color(f, fn, alpha)
+
+    node_colors = (
+        [_node_color(c) for c in combos]
+        + [_node_color(c) for c in combos]
+        + ["rgba(22,163,74,0.85)", "rgba(220,38,38,0.65)"]
+    )
+
+    # Node x-positions so Plotly gives us clean left/right columns.
+    # Hire nodes sit on the far left above the start column.
+    node_x = [0.01] * N + [0.99] * N + [0.01, 0.01]
+    # y-spread by index — let Plotly auto-arrange for now
+    node_y = [None] * (2 * N + 2)
+
+    # ---- Track each pilot's destination by walking planned actions -------
+    pilot_by_id = {p.employee_id: p for p in ss.pilots}
+    pilot_dest: dict[str, tuple[str, str, str]] = {
+        p.employee_id: (p.fleet, p.function, p.nationality)
+        for p in ss.pilots if p.fleet in FLEETS
+    }
+
+    # Aggregate hire flows separately
+    flows: dict[tuple[int, int], dict] = {}
+
+    def _bump(src, dst, desc):
         key = (src, dst)
         if key not in flows:
             flows[key] = {"value": 0, "desc": []}
         flows[key]["value"] += 1
         flows[key]["desc"].append(desc)
 
-    pilot_by_id = {p.employee_id: p for p in ss.pilots}
-
-    # Track each pilot's destination node (starts as source)
-    pilot_dest: dict[str, tuple[str, str, str]] = {
-        p.employee_id: (p.fleet, p.function, p.nationality)
-        for p in ss.pilots if p.fleet in FLEETS
-    }
-
-    # Walk actions that complete on or before up_to_month
     for a in sorted(ss.actions, key=lambda x: x.start_month):
         end = a.start_month + a.duration
         if end > up_to_month + 1:
@@ -1902,6 +1945,9 @@ def _flow_sankey(d, up_to_month: int):
 
         if a.action_type == "Type Rating":
             for tid in a.trainee_ids:
+                # Skip seat support (they don't move)
+                if tid.startswith("SEAT:"):
+                    continue
                 if tid.startswith("TBD"):
                     continue
                 p = pilot_by_id.get(tid)
@@ -1914,6 +1960,8 @@ def _flow_sankey(d, up_to_month: int):
 
         elif a.action_type == "Command Upgrade":
             for tid in a.trainee_ids:
+                if tid.startswith("SEAT:"):
+                    continue
                 if tid.startswith("TBD"):
                     continue
                 p = pilot_by_id.get(tid)
@@ -1925,89 +1973,141 @@ def _flow_sankey(d, up_to_month: int):
                     pilot_dest[tid] = new
 
         elif a.action_type in ("Cadet Hire", "Local Hire"):
-            # New local pilot arriving on destination
             if a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
-                bump(
-                    hire_idx_local,
-                    dst_label_of[(a.to_fleet, a.to_function, "Local")],
-                    f"Hire: {a.new_pilot_name or 'TBD'}",
-                )
+                target = (a.to_fleet, a.to_function, "Local")
+                # Apply filter to hires too
+                if (a.to_fleet in filt_fleets and a.to_function in filt_funcs
+                        and "Local" in filt_nats):
+                    _bump(hire_local_idx, dst_idx[target], f"Hire: {a.new_pilot_name or 'TBD'}")
 
         elif a.action_type == "Expat Hire":
             if a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
-                bump(
-                    hire_idx_expat,
-                    dst_label_of[(a.to_fleet, a.to_function, "Expat")],
-                    f"Hire: {a.new_pilot_name or 'TBD'}",
-                )
+                target = (a.to_fleet, a.to_function, "Expat")
+                if (a.to_fleet in filt_fleets and a.to_function in filt_funcs
+                        and "Expat" in filt_nats):
+                    _bump(hire_expat_idx, dst_idx[target], f"Hire: {a.new_pilot_name or 'TBD'}")
 
-    # Now emit flows for every existing pilot from source -> final destination
+    # ---- Emit start→end flows per pilot ----------------------------------
     for pid, dest in pilot_dest.items():
         p = pilot_by_id.get(pid)
         if not p or p.fleet not in FLEETS:
             continue
         src_combo = (p.fleet, p.function, p.nationality)
-        if src_combo not in src_label_of or dest not in [(*c,) for c in combos]:
+
+        is_static = (src_combo == dest)
+        if show_static and is_static:
             continue
-        src = src_label_of[src_combo]
-        dst = dst_label_of[dest]
-        bump(src, dst, f"{p.employee_id} — {p.full_name}")
+
+        # Filter: flow must touch at least one fleet in filt_fleets, one function in filt_funcs
+        if not (src_combo[0] in filt_fleets or dest[0] in filt_fleets):
+            continue
+        if not (src_combo[1] in filt_funcs or dest[1] in filt_funcs):
+            continue
+        if p.nationality not in filt_nats:
+            continue
+
+        if src_combo not in src_idx or dest not in dst_idx:
+            continue
+
+        _bump(src_idx[src_combo], dst_idx[dest],
+              f"{p.employee_id} — {p.full_name}")
 
     if not flows:
         info_panel(
-            "No flows to display — either no actions are planned or all planned "
-            "actions fall after the snapshot month. Try moving the snapshot "
-            "forward or adding more actions."
+            "No flows match the current filters. Widen the fleet/function/"
+            "nationality filters, or untick <b>Hide non-movers</b> to see "
+            "pilots who stay put."
         )
         return
 
+    # ---- Build the figure -------------------------------------------------
     sources = [k[0] for k in flows.keys()]
     targets = [k[1] for k in flows.keys()]
     values = [v["value"] for v in flows.values()]
-    hovers = [
-        f"<b>{labels[k[0]]} → {labels[k[1]]}</b><br>"
-        f"Count: {v['value']}<br>"
-        + "<br>".join(v["desc"][:8])
-        + (f"<br>…and {len(v['desc']) - 8} more" if len(v["desc"]) > 8 else "")
-        for k, v in flows.items()
-    ]
 
-    # Flow colour = source node colour, semi-transparent
-    def _soft(c):
+    # Hover text: the human-readable list of pilots on each band
+    hovers = []
+    for k, v in flows.items():
+        s_lbl = labels[k[0]].strip()
+        t_lbl = labels[k[1]].strip()
+        desc = v["desc"][:10]
+        more = f"<br>…and {len(v['desc']) - 10} more" if len(v["desc"]) > 10 else ""
+        hovers.append(
+            f"<b>{s_lbl}</b><br>↓<br><b>{t_lbl}</b><br>"
+            f"<b>Count: {v['value']}</b><br><br>"
+            + "<br>".join(desc) + more
+        )
+
+    # Link colour = source node colour, moderately transparent so overlapping
+    # bands don't disappear into a muddy brown
+    def _link_color(src_i: int) -> str:
+        c = node_colors[src_i]
         if c.startswith("rgba"):
             parts = c[5:-1].split(",")
-            return f"rgba({parts[0]},{parts[1]},{parts[2]},0.35)"
+            return f"rgba({parts[0]},{parts[1]},{parts[2]},0.45)"
         return c
-    link_colors = [_soft(node_colors[s]) for s in sources]
+
+    link_colors = [_link_color(s) for s in sources]
 
     fig = go.Figure(go.Sankey(
         arrangement="snap",
         node=dict(
-            pad=14, thickness=14,
-            line=dict(color=COLORS["border"], width=0.5),
+            pad=22,
+            thickness=18,
+            line=dict(color="white", width=1.5),
             label=labels,
             color=node_colors,
-            hovertemplate="<b>%{label}</b><br>Total: %{value}<extra></extra>",
+            x=node_x,
+            y=node_y,
+            hovertemplate="<b>%{label}</b><br>Total: %{value} pilots<extra></extra>",
         ),
         link=dict(
             source=sources, target=targets, value=values,
             color=link_colors,
             customdata=hovers,
             hovertemplate="%{customdata}<extra></extra>",
+            line=dict(color="rgba(255,255,255,0.2)", width=0.3),
         ),
+        textfont=dict(family="Inter, sans-serif", size=12,
+                      color=COLORS["navy"]),
     ))
     fig.update_layout(
-        height=680,
-        margin=dict(l=10, r=10, t=20, b=20),
-        font=dict(size=11),
+        height=720,
+        margin=dict(l=10, r=10, t=30, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, sans-serif", size=12, color=COLORS["navy"]),
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.caption(
-        "Read left to right: starting position → ending position at the chosen "
-        "snapshot month. Band thickness = number of pilots. Hover any band for "
-        "the exact pilots involved. Hover any node for the node total."
+    # Legend / reading guide
+    st.markdown(
+        f"""
+        <div style="background:{COLORS['surface']}; border:1px solid {COLORS['border']};
+             border-radius:10px; padding:12px 16px; margin-top:8px; font-size:12px;">
+            <b>How to read this:</b> each node shows
+            <i>Fleet · Function · Nationality · Position</i>.
+            Start-state nodes sit on the left, end-state on the right.
+            Band thickness = pilot count. Band colour keys on the
+            <i>source</i> fleet — follow a colour to trace one fleet's outflow.
+            Hover any band for the exact pilot list.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
+
+    # ---- Summary table ---------------------------------------------------
+    section_header("Flow summary")
+    rows = []
+    for k, v in sorted(flows.items(), key=lambda kv: -kv[1]["value"]):
+        rows.append({
+            "From": labels[k[0]].strip(),
+            "To": labels[k[1]].strip(),
+            "Pilots": v["value"],
+            "First few": ", ".join(v["desc"][:3]) + ("…" if len(v["desc"]) > 3 else ""),
+        })
+    if rows:
+        st.dataframe(_safe_df(rows), hide_index=True, height=300, width="stretch")
 
 
 def _flow_bubble(d):
