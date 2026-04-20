@@ -37,16 +37,13 @@ NATIONALITIES = ["Local", "Expat"]
 DESIGNATIONS = ["TRE", "TRI", "LI"]
 PILOT_STATUSES = ["Active", "On Type Rating", "On Leave"]
 
-# Training / upgrade durations in months
 TRAINING_DURATIONS = {
     "type_rating_dhc8_to_atr":        2,
     "type_rating_any_to_a320_fo":     2,
     "type_rating_a320_fo_to_a330_fo": 1,
     "cadet_atr_fo":                   2,
     "command_upgrade_same_fleet":     1,
-    "a330_fo_to_a320_captain":        1 + 1,  # type rating + command = 2
-    # Note: spec said 1.5 months; engine operates in whole months, so we
-    # round up to 2 to avoid showing a pilot available while still training.
+    "a330_fo_to_a320_captain":        1 + 1,
 }
 
 ACTION_TYPES = [
@@ -56,19 +53,11 @@ ACTION_TYPES = [
     "Expat Hire",
     "Local Hire",
     "Fleet Change",
+    "Pilot Termination",
 ]
 
-
-# ---------------------------------------------------------------------------
-# Seat Support handling
-# ---------------------------------------------------------------------------
-# Seat Support pilots accompany a Type Rating course without themselves
-# transitioning fleets or functions. They're encoded inside PlannedAction.trainee_ids
-# with the prefix "SEAT:", e.g. "SEAT:L042". The underlying pilot is still
-# off line ops for the duration (so _pilot_unavailable_during_action catches
-# them), but the availability post-arrival routing skips them (so they don't
-# move fleets). This keeps the dataclass schema backwards-compatible with any
-# JSON files saved before this feature existed.
+# Seat Support encoding — trainee_ids entries prefixed with SEAT: are off line
+# ops for the duration but do not change fleet/function.
 SEAT_PREFIX = "SEAT:"
 
 
@@ -86,15 +75,14 @@ def _strip_seat(tid: str) -> tuple[bool, str]:
 class Pilot:
     employee_id: str
     full_name: str
-    nationality: str          # Local | Expat
-    fleet: str                # A330 | A320 | ATR72 | DHC8 | "" if in training for new fleet
-    function: str             # Captain | First Officer
+    nationality: str
+    fleet: str
+    function: str
     designations: list[str] = field(default_factory=list)
     management: bool = False
-    status: str = "Active"    # Active | On Type Rating | On Leave
+    status: str = "Active"
 
     def contribution(self) -> float:
-        """Line-ops contribution weight. 0.0 if not active."""
         if self.status != "Active":
             return 0.0
         return 0.5 if self.management else 1.0
@@ -102,37 +90,27 @@ class Pilot:
 
 @dataclass
 class FleetChange:
-    """A buy or sell event on a specific month index."""
     id: str
     fleet: str
     month_index: int
-    delta: int                 # +1 = buy, -1 = sell
+    delta: int
     note: str = ""
 
 
 @dataclass
 class PlannedAction:
-    """
-    A training, upgrade, or hire action.
-    Fields used vary by action_type; unused fields remain empty/None.
-    """
     id: str
-    action_type: str           # one of ACTION_TYPES
-    start_month: int           # month index when action begins
-    duration: int              # months; for hires it is the training lag, 0 for instant
-    mode: str = "External"     # External | Internal (for Type Rating / Command Upgrade)
-    instructor_id: str = ""    # pilot employee_id, or "" or "TBD"
+    action_type: str
+    start_month: int
+    duration: int
+    mode: str = "External"
+    instructor_id: str = ""
     trainee_ids: list[str] = field(default_factory=list)
-    # Trainee IDs may carry the "SEAT:" prefix to mark seat-support pilots
-    # who are off line ops for the duration but do not change fleet/function.
-    # TBD placeholders (TBD-1, TBD-2) are supported here too.
     from_fleet: str = ""
     from_function: str = ""
     to_fleet: str = ""
     to_function: str = ""
     note: str = ""
-
-    # Hire-specific
     new_pilot_name: str = ""
     new_pilot_nationality: str = ""
 
@@ -141,7 +119,6 @@ class PlannedAction:
 # Date / month helpers
 # ---------------------------------------------------------------------------
 def month_index_to_label(start_year: int, start_month: int, idx: int) -> str:
-    """Convert 0-based index into YYYY-MMM label."""
     y = start_year + (start_month - 1 + idx) // 12
     m = (start_month - 1 + idx) % 12 + 1
     return f"{y}-{calendar.month_abbr[m]}"
@@ -159,10 +136,6 @@ def resolve_aircraft_counts(
     changes: list[FleetChange],
     horizon: int,
 ) -> dict[str, list[int]]:
-    """
-    Returns { fleet: [count_month_0, count_month_1, ...] }.
-    A change on month M applies from month M onward.
-    """
     out = {f: [initial.get(f, 0)] * horizon for f in FLEETS}
     for ch in sorted(changes, key=lambda c: c.month_index):
         if ch.fleet not in out:
@@ -173,10 +146,6 @@ def resolve_aircraft_counts(
 
 
 def fleet_requirement(aircraft_counts: dict[str, list[int]]) -> dict[str, dict[str, list[int]]]:
-    """
-    Returns { fleet: {"Captain": [..], "First Officer": [..]} } for each month.
-    Each aircraft needs CREW_SETS_PER_AIRCRAFT[fleet] Captains and the same number of FOs.
-    """
     req: dict[str, dict[str, list[int]]] = {}
     for fleet, counts in aircraft_counts.items():
         sets = CREW_SETS_PER_AIRCRAFT[fleet]
@@ -192,32 +161,18 @@ def fleet_requirement(aircraft_counts: dict[str, list[int]]) -> dict[str, dict[s
 # Availability resolver
 # ---------------------------------------------------------------------------
 def _action_occupies(action: PlannedAction, month_idx: int) -> bool:
-    """True if the action is in progress during month_idx (inclusive start, exclusive end)."""
     return action.start_month <= month_idx < action.start_month + action.duration
 
 
 def _pilot_unavailable_during_action(action: PlannedAction, pilot_id: str) -> bool:
-    """
-    Does this action take this pilot off line ops during its duration?
-    Covers:
-      - Internal-mode instructor
-      - Named trainees (direct match)
-      - Seat Support pilots (stored with SEAT: prefix in trainee_ids)
-    """
     if action.action_type not in ("Type Rating", "Command Upgrade"):
         return False
-
     if action.mode == "Internal" and action.instructor_id == pilot_id:
         return True
-
-    # Direct trainee match
     if pilot_id in action.trainee_ids:
         return True
-
-    # Seat Support match
     if f"{SEAT_PREFIX}{pilot_id}" in action.trainee_ids:
         return True
-
     return False
 
 
@@ -226,30 +181,26 @@ def compute_availability(
     actions: list[PlannedAction],
     horizon: int,
 ) -> dict[str, dict[str, list[float]]]:
-    """
-    Returns { fleet: {"Captain": [..], "First Officer": [..]} } of summed
-    contributions per month, honouring:
-      - Management pilot 0.5 factor
-      - On Type Rating / On Leave pilots contributing 0
-      - Trainees and (Internal) instructors removed from their source fleet
-        during the action window
-      - Seat Support pilots removed from source fleet during the action, but
-        NOT routed to any destination afterwards (they return to origin)
-      - Trainees who complete a Type Rating or Command Upgrade arrive on the
-        destination fleet/function from the month the action ends onward
-      - Hires (Cadet / Expat / Local) arrive on the destination fleet after
-        their training lag
-    """
     avail: dict[str, dict[str, list[float]]] = {
         f: {"Captain": [0.0] * horizon, "First Officer": [0.0] * horizon} for f in FLEETS
     }
-
     by_id = {p.employee_id: p for p in pilots}
 
+    # Termination month per pilot — contribution drops to zero from this month onward
+    terminated_from: dict[str, int] = {}
+    for a in actions:
+        if a.action_type == "Pilot Termination":
+            for tid in a.trainee_ids:
+                if tid.startswith("TBD"):
+                    continue
+                if tid not in terminated_from or a.start_month < terminated_from[tid]:
+                    terminated_from[tid] = a.start_month
+
     for month in range(horizon):
-        # Baseline: registry contribution for each pilot
         for p in pilots:
             if not p.fleet or p.fleet not in FLEETS:
+                continue
+            if p.employee_id in terminated_from and month >= terminated_from[p.employee_id]:
                 continue
             c = p.contribution()
             if c == 0:
@@ -263,23 +214,16 @@ def compute_availability(
                 continue
             avail[p.fleet][p.function][month] += c
 
-        # Apply arrivals from completed Type Ratings / Command Upgrades / Hires
         for a in actions:
             end = a.start_month + a.duration
             if month < end:
-                continue  # not yet arrived
+                continue
 
             if a.action_type == "Type Rating":
                 for tid in a.trainee_ids:
                     is_seat, real_id = _strip_seat(tid)
-
-                    # Seat Support pilots do not change fleet/function.
-                    # They return to their registry seat automatically via
-                    # the baseline loop above (since from `end` onward the
-                    # action is no longer occupying them), so we skip here.
                     if is_seat:
                         continue
-
                     if real_id.startswith("TBD"):
                         if a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
                             avail[a.to_fleet][a.to_function][month] += 1.0
@@ -287,13 +231,13 @@ def compute_availability(
                         p = by_id.get(real_id)
                         if p is None:
                             continue
+                        if real_id in terminated_from and month >= terminated_from[real_id]:
+                            continue
                         c = 0.5 if p.management else 1.0
                         if p.status != "Active":
                             c = 0.0
-                        # Subtract from original fleet (we added it in baseline)
                         if p.fleet in FLEETS:
                             avail[p.fleet][p.function][month] -= c
-                        # Add to destination
                         if a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
                             avail[a.to_fleet][a.to_function][month] += c
 
@@ -301,16 +245,15 @@ def compute_availability(
                 for tid in a.trainee_ids:
                     is_seat, real_id = _strip_seat(tid)
                     if is_seat:
-                        # Seat support on a command upgrade is unusual but
-                        # handled symmetrically — return to origin, no route.
                         continue
-
                     if real_id.startswith("TBD"):
                         if a.to_fleet in FLEETS:
                             avail[a.to_fleet]["Captain"][month] += 1.0
                     else:
                         p = by_id.get(real_id)
                         if p is None:
+                            continue
+                        if real_id in terminated_from and month >= terminated_from[real_id]:
                             continue
                         c = 0.5 if p.management else 1.0
                         if p.status != "Active":
@@ -324,9 +267,6 @@ def compute_availability(
                 if a.to_fleet in FLEETS and a.to_function in FUNCTIONS:
                     avail[a.to_fleet][a.to_function][month] += 1.0
 
-    # Clamp to non-negative — protects against edge cases where a pilot's
-    # listed fleet equals their destination fleet and the subtract/add
-    # cycle briefly goes negative.
     for f in avail:
         for fn in avail[f]:
             avail[f][fn] = [max(0.0, v) for v in avail[f][fn]]
@@ -363,13 +303,6 @@ def compute_gaps(
 # Conflict detection
 # ---------------------------------------------------------------------------
 def detect_conflicts(actions: list[PlannedAction]) -> list[dict[str, Any]]:
-    """
-    Return a list of conflict records: {pilot_id, actions: [id, id], reason}.
-    A conflict = the same named pilot (not TBD) assigned to overlapping actions
-    where both actions would remove them from line ops.
-    Seat Support entries (SEAT: prefix) are normalised so a seat-support
-    booking collides with a training booking for the same pilot.
-    """
     conflicts: list[dict[str, Any]] = []
     pilot_windows: dict[str, list[tuple[PlannedAction, int, int]]] = {}
 
@@ -397,7 +330,7 @@ def detect_conflicts(actions: list[PlannedAction]) -> list[dict[str, Any]]:
             for j in range(i + 1, len(entries)):
                 a1, s1, e1 = entries[i]
                 a2, s2, e2 = entries[j]
-                if s2 < e1:  # overlap
+                if s2 < e1:
                     conflicts.append({
                         "pilot_id": pid,
                         "action_ids": [a1.id, a2.id],
@@ -415,14 +348,6 @@ def build_cascade_graph(
     pilots: list[Pilot],
     all_actions: list[PlannedAction],
 ) -> dict[str, Any]:
-    """
-    Produce a node-and-edge graph describing the trickle-down of one action.
-    Nodes: { id, label, kind, month }
-    Edges: { source, target, label }
-    kind in: trigger, slot, training, arrival, note
-    The UI renders this with Plotly (Sankey or network); the PDF renders the
-    same structure as a static PNG via Kaleido.
-    """
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     by_id = {p.employee_id: p for p in pilots}
@@ -446,10 +371,9 @@ def build_cascade_graph(
                 real_id, real_id, "", "", "", [], False, "Active")).full_name
 
             if is_seat:
-                # Seat support on a command upgrade — returns to origin
                 sid = f"seat_{i}"
-                back_label = f"{name}\nseat support ({action.duration}mo)\nreturns to origin"
-                add_node(sid, back_label, "training", start)
+                add_node(sid, f"{name}\nseat support ({action.duration}mo)\nreturns to origin",
+                         "training", start)
                 add_edge("root", sid)
                 continue
 
@@ -517,7 +441,6 @@ def build_cascade_graph(
             add_edge("root", tr_id)
 
             if is_seat:
-                # Seat support returns to original role — no routing, no slot
                 back_id = f"back_{i}"
                 if real_id in by_id:
                     p = by_id[real_id]
@@ -557,17 +480,44 @@ def build_cascade_graph(
         add_node("impact", "Requirement recalculates\nfrom this month", "note", start)
         add_edge("root", "impact")
 
+    elif action.action_type == "Pilot Termination":
+        add_node("root", f"Pilot Termination\n{len(action.trainee_ids)} pilot(s)",
+                 "trigger", start)
+        for i, tid in enumerate(action.trainee_ids):
+            if tid.startswith("TBD"):
+                name = tid
+                origin = "TBD"
+                p = None
+            else:
+                p = by_id.get(tid)
+                name = p.full_name if p else tid
+                origin = f"{p.fleet} {p.function}" if p else "unknown"
+            t_id = f"term_{i}"
+            add_node(t_id, f"{name}\ndeparts from {origin}", "note", start)
+            add_edge("root", t_id, "removed from roster")
+            if p and p.fleet in FLEETS:
+                slot_id = f"slot_{i}"
+                add_node(slot_id, f"{p.fleet} {p.function}\nslot opens",
+                         "slot", start)
+                add_edge(t_id, slot_id)
+
     return {"nodes": nodes, "edges": edges}
 
 
 # ---------------------------------------------------------------------------
 # Localisation analysis
 # ---------------------------------------------------------------------------
-def eligible_feeders_for(expat: Pilot, pilots: list[Pilot]) -> list[dict[str, Any]]:
-    """
-    For a given expat position, find local pilots who could fill it and return
-    the route, duration, and feasibility.
-    """
+def eligible_feeders_for(
+    expat: Pilot,
+    pilots: list[Pilot],
+    actions: list[PlannedAction] | None = None,
+) -> list[dict[str, Any]]:
+    terminated: set[str] = set()
+    if actions:
+        for a in actions:
+            if a.action_type == "Pilot Termination":
+                terminated.update(t for t in a.trainee_ids if not t.startswith("TBD"))
+
     candidates: list[dict[str, Any]] = []
     target_fleet = expat.fleet
     target_function = expat.function
@@ -578,6 +528,8 @@ def eligible_feeders_for(expat: Pilot, pilots: list[Pilot]) -> list[dict[str, An
         if p.status != "Active":
             continue
         if p.employee_id == expat.employee_id:
+            continue
+        if p.employee_id in terminated:
             continue
         route, duration = _training_route(p, target_fleet, target_function)
         if route is None:
@@ -595,7 +547,6 @@ def eligible_feeders_for(expat: Pilot, pilots: list[Pilot]) -> list[dict[str, An
 
 
 def _training_route(pilot: Pilot, to_fleet: str, to_function: str) -> tuple[str | None, int]:
-    """Return (human-readable route, duration in months) or (None, 0) if infeasible."""
     f, fn = pilot.fleet, pilot.function
 
     if f == to_fleet and fn == to_function:
@@ -655,7 +606,6 @@ SCHEMA_VERSION = 1
 
 
 def serialise_state(state: dict[str, Any]) -> dict[str, Any]:
-    """Convert session state into a plain-dict payload safe for JSON dump."""
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": date.today().isoformat(),
