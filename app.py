@@ -2178,7 +2178,8 @@ def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, 
     if not labels_months:
         info_panel("No months to display."); return
 
-    # Identify "activity months" — months where any action starts or ends
+    ## Identify "activity months" — months where any action starts or ends,
+    # plus one month BEFORE each hire's arrival to render the incoming band.
     activity_months: set[int] = {0, up_to_month}
     for a in ss.actions:
         if a.start_month <= up_to_month:
@@ -2186,7 +2187,11 @@ def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, 
         end = a.start_month + a.duration
         if end <= up_to_month:
             activity_months.add(end)
-    # Hires also count
+        # Pre-arrival: one month before a hire joins the roster
+        if a.action_type in ("Cadet Hire", "Local Hire", "Expat Hire"):
+            pre = end - 1
+            if 0 <= pre <= up_to_month:
+                activity_months.add(pre)
     activity_months = sorted(m for m in activity_months if 0 <= m <= up_to_month)
 
     # If the horizon has more than 8 activity months, sample to keep readable
@@ -2284,7 +2289,7 @@ def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, 
         idx = len(node_ids)
         hire_node_map[key] = idx
         node_ids.append(f"m{month}_hire_{nat}")
-        node_labels.append(f"+ Hire ({nat[:3]})")
+        node_labels.append(f"Incoming {nat}")
         node_colors.append(
             "rgba(22,163,74,0.85)" if nat == "Local"
             else "rgba(220,38,38,0.65)"
@@ -2372,13 +2377,26 @@ def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, 
             dst = ensure_node(m1, pos1)
             _bump(src, dst, f"{pid} — {name}")
 
-        # New hires that arrived in (m0, m1]: link from Hire node at m1
+        # New hires — two-stage flow:
+        #   1. An "Incoming" node appears in the month BEFORE arrival
+        #   2. On arrival month, that band flows into the fleet/function group
         for end, a in virtual_hires:
-            if m0 < end <= m1:
-                nat = "Local" if a.action_type in ("Cadet Hire", "Local Hire") else "Expat"
-                if a.to_fleet not in filt_fleets: continue
-                if a.to_function not in filt_funcs: continue
-                if nat not in filt_nats: continue
+            nat = "Local" if a.action_type in ("Cadet Hire", "Local Hire") else "Expat"
+            if a.to_fleet not in filt_fleets: continue
+            if a.to_function not in filt_funcs: continue
+            if nat not in filt_nats: continue
+
+            pre = end - 1
+
+            # Stage 1: pre-arrival → arrival (this is the "incoming" ribbon)
+            # Only emit once, on the interval where m0 == pre and m1 >= end
+            if pre >= 0 and m0 == pre and m1 >= end:
+                src = ensure_hire_node(pre, nat)
+                dst = ensure_node(m1, (a.to_fleet, a.to_function, nat))
+                _bump(src, dst, f"Hire: {a.new_pilot_name or 'TBD'} ({a.action_type})")
+            # Stage 2: pre-arrival might be before our horizon (negative).
+            # In that case, fall back to a single-column hire emission at m1.
+            elif pre < 0 and m0 < end <= m1:
                 src = ensure_hire_node(m1, nat)
                 dst = ensure_node(m1, (a.to_fleet, a.to_function, nat))
                 _bump(src, dst, f"Hire: {a.new_pilot_name or 'TBD'}")
