@@ -153,11 +153,25 @@ def render_topbar():
     total_aircraft = sum(ss.initial_aircraft.values())
     period = f"{d['labels'][0]} → {d['labels'][-1]}" if d["labels"] else "—"
 
+    import base64
+    from pathlib import Path
+
+    # Load the logo as base64 so it embeds directly in HTML
+    logo_html = '<div class="iasl-logo">IASL</div>'  # fallback
+    logo_path = Path(__file__).parent / "assets" / "Maldivian.png"
+    if logo_path.exists():
+        with open(logo_path, "rb") as f:
+            logo_b64 = base64.b64encode(f.read()).decode("utf-8")
+        logo_html = (
+            f'<img src="data:image/png;base64,{logo_b64}" '
+            'class="iasl-logo-img" alt="IASL logo" />'
+        )
+
     st.markdown(
         f"""
         <div class="iasl-topbar">
           <div class="iasl-brand">
-            <div class="iasl-logo">IASL</div>
+            {logo_html}
             <div>
               <div class="iasl-title">Crew Planning Portal</div>
               <div class="iasl-subtitle">Island Aviation Services Limited</div>
