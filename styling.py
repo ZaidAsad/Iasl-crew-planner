@@ -198,6 +198,15 @@ h3 { font-size: 1.1rem; }
     letter-spacing: 0.5px;
     box-shadow: 0 4px 12px rgba(0,133,122,0.25);
 }
+.iasl-logo-img {
+    width: 48px;
+    height: 48px;
+    object-fit: contain;
+    border-radius: 8px;
+    background: white;
+    padding: 4px;
+    box-shadow: 0 2px 8px rgba(15, 41, 68, 0.08);
+}
 .iasl-title {
     font-size: 17px; font-weight: 700; color: __NAVY__;
     line-height: 1.1;
@@ -416,6 +425,41 @@ h3 { font-size: 1.1rem; }
     border: 1px solid __BORDER__;
     border-radius: 8px;
     color: __NAVY__;
+}
+
+.iasl-footer {
+    margin-top: 48px;
+    padding: 16px 20px;
+    background: __SURFACE__;
+    border: 1px solid __BORDER__;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 12px;
+    color: __MUTED__;
+    box-shadow: 0 1px 3px rgba(15,41,68,0.04);
+}
+.iasl-footer-left {
+    color: __NAVY__;
+}
+.iasl-footer-right {
+    text-align: right;
+}
+.iasl-footer-sep {
+    color: __BORDER__;
+    margin: 0 8px;
+}
+@media (max-width: 768px) {
+    .iasl-footer {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+    .iasl-footer-right {
+        text-align: left;
+    }
 }
 
 #MainMenu { visibility: hidden; }
