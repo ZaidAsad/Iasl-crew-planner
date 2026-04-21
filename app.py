@@ -3413,6 +3413,28 @@ def main():
                     "to download a backup before refreshing the page."
                 )
 
+    render_footer()
+
+def render_footer():
+    current_year = date.today().year
+    st.markdown(
+        f"""
+        <div class="iasl-footer">
+          <div class="iasl-footer-left">
+            <b>IASL Crew Planning Portal</b>
+            <span class="iasl-footer-sep">·</span>
+            <span>Flight Operations · Island Aviation Services Limited</span>
+          </div>
+          <div class="iasl-footer-right">
+            © {current_year} Zaid Asad. All rights reserved.
+            <span class="iasl-footer-sep">·</span>
+            <span>Confidential — internal use only</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 if __name__ == "__main__":
     main()
