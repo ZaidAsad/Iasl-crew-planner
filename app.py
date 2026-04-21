@@ -196,7 +196,12 @@ def render_topbar():
         unsafe_allow_html=True,
     )
 
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 6])
+
+def render_bottom_actions():
+    """Save JSON / Load JSON / Print PDF controls rendered at the bottom of the app."""
+    section_header("Plan file actions")
+
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
 
     with c1:
         payload = json.dumps(
@@ -209,16 +214,17 @@ def render_topbar():
             file_name=f"iasl_crew_plan_{date.today().isoformat()}.json",
             mime="application/json",
             width="stretch",
+            help="Download the current plan as a JSON file you can reload later.",
         )
 
     with c2:
         uploaded = st.file_uploader(
-            "Load JSON", type=["json"],
-            label_visibility="collapsed",
+            "📂 Load JSON",
+            type=["json"],
             key="json_uploader",
+            help="Upload a previously-saved JSON to restore your plan.",
         )
         if uploaded is not None:
-            # Only restore ONCE per upload — guard against reruns re-applying the file
             upload_id = f"{uploaded.name}_{uploaded.size}"
             if st.session_state.get("_last_loaded_upload_id") != upload_id:
                 try:
@@ -233,7 +239,8 @@ def render_topbar():
                     st.error(f"Failed to load JSON: {e}")
 
     with c3:
-        if st.button("🖨 Print PDF", width="stretch", type="primary"):
+        if st.button("🖨 Generate PDF", width="stretch", type="primary",
+                     help="Build a printable PDF of the full plan."):
             with st.spinner("Generating PDF…"):
                 try:
                     pdf_bytes = build_pdf(current_state_payload())
@@ -242,13 +249,29 @@ def render_topbar():
                 except Exception as e:
                     st.error(f"PDF generation failed: {e}")
 
-    if st.session_state.get("pdf_bytes"):
-        st.download_button(
-            "⬇ Download PDF",
-            data=st.session_state["pdf_bytes"],
-            file_name=f"iasl_crew_plan_{date.today().isoformat()}.pdf",
-            mime="application/pdf",
-        )
+        if st.session_state.get("pdf_bytes"):
+            st.download_button(
+                "⬇ Download PDF",
+                data=st.session_state["pdf_bytes"],
+                file_name=f"iasl_crew_plan_{date.today().isoformat()}.pdf",
+                mime="application/pdf",
+                width="stretch",
+            )
+
+    with c4:
+        if st.session_state.get("_autosave_payload"):
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if st.button("↩ Restore autosave", key="restore_autosave",
+                         help="Recover the most recent autosave of your plan."):
+                try:
+                    restored = deserialise_state(st.session_state["_autosave_payload"])
+                    for k, v in restored.items():
+                        st.session_state[k] = v
+                    st.success("Autosave restored.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Restore failed: {e}")
+
 
 
 # ---------------------------------------------------------------------------
