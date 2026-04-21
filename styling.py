@@ -141,7 +141,30 @@ html, body, [class*="css"] {
 .block-container {
     padding-top: 1.2rem;
     padding-bottom: 3rem;
-    max-width: 1400px;
+    padding-left: 2rem;
+    padding-right: 2rem;
+    max-width: 100%;
+}
+
+/* Extra breathing room on very wide monitors */
+@media (min-width: 1600px) {
+    .block-container {
+        padding-left: 3rem;
+        padding-right: 3rem;
+    }
+}
+
+/* Ensure charts, tables, and the tab bar fill the full width */
+.main .block-container,
+section.main > div {
+    max-width: 100% !important;
+}
+.stTabs [data-baseweb="tab-list"] {
+    width: 100%;
+}
+[data-testid="stDataFrame"],
+[data-testid="stPlotlyChart"] {
+    width: 100% !important;
 }
 
 h1, h2, h3, h4 {
