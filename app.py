@@ -2034,16 +2034,42 @@ def tab_print_plan():
         
     section_header("Action summary")
     if ss.actions:
+        pilot_by_id = {p.employee_id: p for p in ss.pilots}
         rows = []
         for a in sorted(ss.actions, key=lambda x: x.start_month):
             mo = d["labels"][a.start_month] if 0 <= a.start_month < len(d["labels"]) else f"M{a.start_month}"
+
+            # Build from / to display based on action type
+            if a.action_type == "Pilot Termination":
+                names = []
+                for tid in a.trainee_ids[:2]:
+                    p = pilot_by_id.get(tid)
+                    names.append(p.full_name if p else tid)
+                from_display = ", ".join(names) + (
+                    f" +{len(a.trainee_ids) - 2}" if len(a.trainee_ids) > 2 else ""
+                )
+                to_display = "Departed"
+            elif a.action_type == "Fleet Change":
+                from_display = a.from_fleet
+                to_display = a.note or "—"
+            elif a.action_type in ("Cadet Hire", "Local Hire", "Expat Hire"):
+                from_display = a.new_pilot_name or "TBD"
+                to_display = f"{a.to_fleet} {a.to_function}".strip() or "—"
+            else:
+                from_display = f"{a.from_fleet} {a.from_function}".strip() or "—"
+                to_display = f"{a.to_fleet} {a.to_function}".strip() or "—"
+
             cost_val = getattr(a, "cost", 0.0) or 0.0
             cost_cur = getattr(a, "cost_currency", "USD") or "USD"
             cost_display = f"{cost_cur} {cost_val:,.0f}" if cost_val > 0 else "—"
+
             rows.append({
-                "Month": mo, "Type": a.action_type,
-                "From": from_display, "To": to_display,
-                "Mode": a.mode, "Duration": f"{a.duration}mo" if a.duration else "—",
+                "Month": mo,
+                "Type": a.action_type,
+                "From": from_display,
+                "To": to_display,
+                "Mode": a.mode,
+                "Duration": f"{a.duration}mo" if a.duration else "—",
                 "Cost": cost_display,
             })
         st.dataframe(_safe_df(rows), hide_index=True, width="stretch")
