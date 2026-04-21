@@ -2398,6 +2398,13 @@ def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, 
                           for i in range(len(activity_months))],
     )
 
+    _render_localisation_strip(
+        activity_months=activity_months,
+        column_positions=[0.02 + 0.96 * (i / max(1, len(activity_months) - 1))
+                          for i in range(len(activity_months))],
+        labels_by_month={m: d["labels"][m] for m in activity_months},
+    )
+
 
 def _render_sankey_figure(
     labels, node_colors, node_x, flows,
@@ -2494,6 +2501,234 @@ def _render_sankey_figure(
         })
     if rows:
         st.dataframe(_safe_df(rows), hide_index=True, height=300, width="stretch")
+
+def _render_localisation_strip(activity_months, column_positions, labels_by_month):
+    """
+    Renders a horizontal strip of localisation indicators, one column per
+    activity_month in the time-aware Sankey. Each column shows:
+      - Overall local % across all fleets at that month
+      - Per-fleet local % as horizontal mini-bars
+    Designed to sit directly under the time-aware Sankey and align column-by-column.
+    """
+    ss = st.session_state
+
+    # Build terminated lookup so post-termination counts are accurate
+    terminated_at: dict[str, int] = {}
+    for a in ss.actions:
+        if a.action_type == "Pilot Termination":
+            for tid in a.trainee_ids:
+                if tid.startswith("TBD"):
+                    continue
+                if tid not in terminated_at or a.start_month < terminated_at[tid]:
+                    terminated_at[tid] = a.start_month
+
+    # Build virtual hires (people who join by end of their training)
+    virtual_hires = []
+    for a in ss.actions:
+        if a.action_type in ("Cadet Hire", "Local Hire", "Expat Hire"):
+            end = a.start_month + a.duration
+            nat = "Local" if a.action_type in ("Cadet Hire", "Local Hire") else "Expat"
+            virtual_hires.append((end, a.to_fleet, a.to_function, nat))
+
+    def snapshot_at_month(m):
+        """Return list of (fleet, function, nationality) tuples active at month m."""
+        snap = []
+        for p in ss.pilots:
+            if p.fleet not in FLEETS:
+                continue
+            if p.employee_id in terminated_at and m > terminated_at[p.employee_id]:
+                continue
+            # Apply completed transitions up to and including month m
+            cur_fleet, cur_fn, cur_nat = p.fleet, p.function, p.nationality
+            for a in sorted(ss.actions, key=lambda x: x.start_month):
+                if a.action_type == "Pilot Termination":
+                    continue
+                end = a.start_month + a.duration
+                if end > m:
+                    continue
+                if p.employee_id not in a.trainee_ids:
+                    continue
+                if f"SEAT:{p.employee_id}" in a.trainee_ids:
+                    continue
+                if a.action_type == "Type Rating":
+                    cur_fleet, cur_fn = a.to_fleet, a.to_function
+                elif a.action_type == "Command Upgrade":
+                    cur_fleet, cur_fn = a.to_fleet, "Captain"
+            snap.append((cur_fleet, cur_fn, cur_nat))
+        # Add virtual hires
+        for end, fleet, fn, nat in virtual_hires:
+            if end <= m:
+                snap.append((fleet, fn, nat))
+        return snap
+
+    # Compute per-fleet local% and overall local% for each column
+    columns_data = []
+    for m in activity_months:
+        snap = snapshot_at_month(m)
+        per_fleet = {}
+        for f in FLEETS:
+            pilots_in_f = [s for s in snap if s[0] == f]
+            total = len(pilots_in_f)
+            local = sum(1 for s in pilots_in_f if s[2] == "Local")
+            pct = (local / total * 100) if total else 0.0
+            per_fleet[f] = {"local": local, "total": total, "pct": pct}
+        total_all = sum(v["total"] for v in per_fleet.values())
+        local_all = sum(v["local"] for v in per_fleet.values())
+        overall_pct = (local_all / total_all * 100) if total_all else 0.0
+        columns_data.append({
+            "month": m,
+            "label": labels_by_month[m],
+            "per_fleet": per_fleet,
+            "overall": overall_pct,
+            "local_total": local_all,
+            "total": total_all,
+        })
+
+    # Build the figure — one horizontal plot, divided into column regions
+    n_cols = len(columns_data)
+    if n_cols == 0:
+        return
+
+    fig = go.Figure()
+
+    # Dimensional model: x axis is 0..n_cols, with 1 unit per column.
+    # Inside each column we lay out:
+    #   overall %: big number centred at y≈0.82, with a tint-filled background rectangle
+    #   four fleet bars stacked from y=0.58 down to y=0.05
+    col_width = 1.0
+    bar_height = 0.11
+    bar_gap = 0.03
+    fleet_y_top = 0.58  # top fleet bar starts here and we go down
+
+    def _band_color_for_pct(pct):
+        if pct >= 80: return COLORS["green"]
+        if pct >= 50: return COLORS["amber"]
+        return COLORS["red"]
+
+    def _band_tint_for_pct(pct):
+        if pct >= 80: return "rgba(22,163,74,0.10)"
+        if pct >= 50: return "rgba(217,119,6,0.10)"
+        return "rgba(220,38,38,0.08)"
+
+    for col_i, cd in enumerate(columns_data):
+        x0 = col_i
+        x1 = col_i + col_width
+        xc = col_i + col_width / 2
+
+        # Outer card background
+        fig.add_shape(
+            type="rect",
+            x0=x0 + 0.03, x1=x1 - 0.03,
+            y0=0.0, y1=0.95,
+            fillcolor=COLORS["surface"],
+            line=dict(color=COLORS["border"], width=1),
+            layer="below",
+        )
+
+        # Overall % tinted background band at top
+        fig.add_shape(
+            type="rect",
+            x0=x0 + 0.03, x1=x1 - 0.03,
+            y0=0.68, y1=0.95,
+            fillcolor=_band_tint_for_pct(cd["overall"]),
+            line=dict(width=0),
+            layer="below",
+        )
+
+        # Overall % big number
+        fig.add_annotation(
+            x=xc, y=0.85, xref="x", yref="y",
+            text=f"<b style='font-size:24px'>{cd['overall']:.0f}%</b>",
+            showarrow=False,
+            font=dict(color=_band_color_for_pct(cd["overall"]), family="Inter"),
+        )
+        # "Overall local" caption
+        fig.add_annotation(
+            x=xc, y=0.72, xref="x", yref="y",
+            text=f"<span style='font-size:10px;color:{COLORS['text_muted']}'>"
+                 f"{cd['local_total']}/{cd['total']} local overall</span>",
+            showarrow=False,
+        )
+
+        # Per-fleet bars — stacked downward from fleet_y_top
+        for fi, f in enumerate(FLEETS):
+            row = cd["per_fleet"][f]
+            y_top = fleet_y_top - fi * (bar_height + bar_gap)
+            y_bot = y_top - bar_height
+
+            # Background of the bar (full-width track)
+            fig.add_shape(
+                type="rect",
+                x0=x0 + 0.28, x1=x1 - 0.06,
+                y0=y_bot, y1=y_top,
+                fillcolor=COLORS["border"],
+                line=dict(width=0),
+                layer="below",
+                opacity=0.3,
+            )
+
+            # Foreground (local %) — only if total > 0
+            if row["total"] > 0:
+                fill_width = (x1 - 0.06) - (x0 + 0.28)
+                fill_x1 = (x0 + 0.28) + fill_width * (row["pct"] / 100)
+                fig.add_shape(
+                    type="rect",
+                    x0=x0 + 0.28, x1=fill_x1,
+                    y0=y_bot, y1=y_top,
+                    fillcolor=FLEET_COLORS[f],
+                    line=dict(width=0),
+                    layer="below",
+                )
+
+            # Fleet name on left
+            fig.add_annotation(
+                x=x0 + 0.07, y=(y_top + y_bot) / 2, xref="x", yref="y",
+                text=f"<b style='font-size:10px;color:{FLEET_COLORS[f]}'>{f}</b>",
+                showarrow=False, xanchor="left",
+            )
+
+            # Percentage on right
+            pct_text = f"{row['pct']:.0f}%" if row["total"] > 0 else "—"
+            fig.add_annotation(
+                x=x1 - 0.04, y=(y_top + y_bot) / 2, xref="x", yref="y",
+                text=f"<b style='font-size:10px;color:{COLORS['navy']}'>{pct_text}</b>",
+                showarrow=False, xanchor="right",
+            )
+
+        # Month label below the card
+        fig.add_annotation(
+            x=xc, y=-0.05, xref="x", yref="y",
+            text=f"<b style='font-size:11px;color:{COLORS['accent']}'>{cd['label']}</b>",
+            showarrow=False,
+        )
+
+    fig.update_layout(
+        height=240,
+        xaxis=dict(
+            visible=False,
+            range=[-0.05, n_cols + 0.05],
+            fixedrange=True,
+        ),
+        yaxis=dict(
+            visible=False,
+            range=[-0.12, 1.0],
+            fixedrange=True,
+        ),
+        margin=dict(l=10, r=10, t=20, b=30),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+    )
+
+    section_header("Localisation at each Sankey time column")
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Each card corresponds to the time column above it in the Sankey. "
+        "The large percentage is the overall local share across all four fleets; "
+        "the mini-bars show per-fleet local share. Colour-coded: green ≥ 80%, "
+        "amber 50–79%, red < 50%."
+    )
+
 
 
 def _flow_bubble(d):
