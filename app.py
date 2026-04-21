@@ -2063,6 +2063,8 @@ def _flow_sankey_classic(d, up_to_month, filt_fleets, filt_funcs, filt_nats, sho
     )
     node_x = [0.01] * N + [0.99] * N + [0.01, 0.01]
 
+    pilot_by_id = {p.employee_id: p for p in ss.pilots}
+    
     terminated: set[str] = set()
     for a in ss.actions:
         if a.action_type == "Pilot Termination" and a.start_month <= up_to_month:
@@ -2095,7 +2097,6 @@ def _flow_sankey_classic(d, up_to_month, filt_fleets, filt_funcs, filt_nats, sho
                 p = pilot_by_id.get(tid)
                 if not p or p.fleet not in FLEETS: continue
                 pilot_dest[tid] = (a.to_fleet, a.to_function, p.nationality)
-                pilot_dest[tid] = new
         elif a.action_type == "Command Upgrade":
             for tid in a.trainee_ids:
                 if tid.startswith("SEAT:") or tid.startswith("TBD"): continue
