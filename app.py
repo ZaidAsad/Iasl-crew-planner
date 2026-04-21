@@ -1004,7 +1004,12 @@ def _form_pilot_termination(d):
 
     c1, c2 = st.columns([3, 2])
     with c1:
-        term_month = _month_selector(d, "term_start")
+        term_month = st.selectbox(
+            "Termination month",
+            options=list(range(ss.horizon)),
+            format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}" if i < len(d['labels']) else str(i),
+            key="term_start",
+        )
     with c2:
         reason = st.selectbox(
             "Reason",
@@ -1013,40 +1018,77 @@ def _form_pilot_termination(d):
             key="term_reason",
         )
 
-    st.markdown("**Pilots to terminate** (pick one or more)")
-    pilots = _pilot_picker(
-        "Select pilots", "term_pilots",
-        allow_tbd=False,
-        max_selections=10,
+    # Build a direct multiselect of pilots — no helper, no toggle, no extra widgets
+    # that could interfere with the form context.
+    st.markdown("**Pilots to terminate** (search by name, ID, fleet, function, nationality)")
+
+    # Sort for a sensible display order
+    status_rank = {"Active": 0, "On Type Rating": 1, "On Leave": 2}
+    sorted_pilots = sorted(
+        ss.pilots,
+        key=lambda p: (status_rank.get(p.status, 3), p.fleet, p.function, p.full_name),
     )
 
-    note = st.text_input("Note (optional)", key="term_note", placeholder="Context or replacement plan…")
+    options_map: dict[str, str] = {}
+    for p in sorted_pilots:
+        mgmt_tag = " · MGMT" if p.management else ""
+        status_tag = "" if p.status == "Active" else f" · {p.status}"
+        lbl = (
+            f"{p.employee_id}  |  {p.full_name}  |  "
+            f"{p.fleet} {p.function}  |  {p.nationality}{mgmt_tag}{status_tag}"
+        )
+        options_map[lbl] = p.employee_id
 
-    if st.form_submit_button("Schedule termination(s)", type="primary"):
-        if not pilots:
+    selected_labels = st.multiselect(
+        "Select pilots",
+        options=list(options_map.keys()),
+        key="term_pilots_direct",
+        placeholder="Type to search by name, ID, fleet, or nationality…",
+    )
+
+    note = st.text_input(
+        "Note (optional)", key="term_note",
+        placeholder="Context or replacement plan…",
+    )
+
+    submitted = st.form_submit_button("Schedule termination(s)", type="primary")
+
+    if submitted:
+        selected_pilot_ids = [options_map[lbl] for lbl in selected_labels]
+
+        if not selected_pilot_ids:
             st.error("Pick at least one pilot.")
             return
 
         pilot_by_id = {p.employee_id: p for p in ss.pilots}
-        # Show confirmation summary in session for the user's peace of mind
         summary_bits = []
-        for pid in pilots:
+        for pid in selected_pilot_ids:
             p = pilot_by_id.get(pid)
             if p:
-                summary_bits.append(f"{p.full_name} ({p.fleet} {p.function}, {p.nationality})")
+                summary_bits.append(
+                    f"{p.full_name} ({p.fleet} {p.function}, {p.nationality})"
+                )
 
         combined_note = f"Reason: {reason}"
         if note.strip():
             combined_note += f" — {note.strip()}"
 
-        ss.actions.append(PlannedAction(
-            id=new_id("act"), action_type="Pilot Termination",
-            start_month=term_month, duration=0, mode="—",
-            trainee_ids=list(pilots),
+        new_action = PlannedAction(
+            id=new_id("act"),
+            action_type="Pilot Termination",
+            start_month=int(term_month),
+            duration=0,
+            mode="—",
+            trainee_ids=list(selected_pilot_ids),
             note=combined_note,
-        ))
-        st.success(f"Scheduled termination of {len(pilots)} pilot(s): {', '.join(summary_bits[:3])}"
-                   + (f" and {len(summary_bits) - 3} more" if len(summary_bits) > 3 else ""))
+        )
+        ss.actions.append(new_action)
+
+        st.success(
+            f"Scheduled termination of {len(selected_pilot_ids)} pilot(s): "
+            f"{', '.join(summary_bits[:3])}"
+            + (f" and {len(summary_bits) - 3} more" if len(summary_bits) > 3 else "")
+        )
         st.rerun()
 
 def _form_type_rating(d):
