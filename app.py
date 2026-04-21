@@ -2807,23 +2807,37 @@ def main():
     render_topbar()
 
     tabs = st.tabs([
-        "📊 Dashboard", "👥 Registry", "✈ Fleet Planner", "📅 Timeline",
-        "🎯 Action Planner", "🌐 Flow Map", "🌏 Localisation",
-        "🤖 AI Optimiser", "🖨 Print Plan",
+        "📊 Dashboard",
+        "👥 Registry",
+        "✈ Fleet Planner",
+        "📅 Timeline",
+        "🎯 Action Planner",
+        "🌐 Flow Map",
+        "🌏 Localisation",
+        "🤖 AI Optimiser",
+        "🖨 Print Plan",
     ])
 
     tab_funcs = [
-        tab_dashboard, tab_registry, tab_fleet_planner, tab_timeline,
-        tab_action_planner, tab_flow_map, tab_localisation,
-        tab_ai_optimiser, tab_print_plan,
+        tab_dashboard,
+        tab_registry,
+        tab_fleet_planner,
+        tab_timeline,
+        tab_action_planner,
+        tab_flow_map,
+        tab_localisation,
+        tab_ai_optimiser,
+        tab_print_plan,
     ]
 
+    import traceback
     for tab, fn in zip(tabs, tab_funcs):
         with tab:
             try:
                 fn()
             except Exception as e:
                 st.error(f"Error in {fn.__name__}: {type(e).__name__}: {e}")
+                st.code(traceback.format_exc(), language="python")
                 st.caption(
                     "Your plan data is safe. Click **Save JSON** in the top bar "
                     "to download a backup before refreshing the page."
