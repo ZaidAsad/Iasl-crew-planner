@@ -9,6 +9,7 @@ import io as _io
 import json
 from datetime import date, datetime
 
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -26,6 +27,7 @@ from cascade_engine import (
     serialise_state, deserialise_state, new_id,
 )
 from pdf_export import build_pdf
+from latex_export import build_latex
 from styling import (
     COLORS, FLEET_COLORS,
     inject_css, register_plotly_theme,
@@ -2116,6 +2118,48 @@ def tab_print_plan():
             file_name=f"iasl_crew_{mode_tag}_{date.today().isoformat()}.pdf",
             mime="application/pdf",
         )
+
+    st.markdown("---")
+    section_header("Generate LaTeX executive report")
+    st.markdown(
+        "Produces a self-contained `.tex` file formatted for board and "
+        "Managing Director circulation. Compile locally with any TeX Live "
+        "distribution or paste into Overleaf. The document includes fleet "
+        "composition, training milestones, a full expat-vs-local financial "
+        "model with peg and shadow-rate sensitivities, cumulative cost and "
+        "savings trajectory, and a formal budget approval request with "
+        "signature blocks."
+    )
+
+    lc1, lc2 = st.columns([2, 5])
+    with lc1:
+        if st.button("📄 Generate .tex", width="stretch", type="primary",
+                     key="gen_latex"):
+            with st.spinner("Building LaTeX source…"):
+                try:
+                    tex_source = build_latex(current_state_payload())
+                    st.session_state["latex_source"] = tex_source
+                    st.success(
+                        f"LaTeX ready — {len(tex_source):,} characters. "
+                        "Download below and compile on Overleaf."
+                    )
+                except Exception as e:
+                    import traceback
+                    st.error(f"LaTeX generation failed: {e}")
+                    st.code(traceback.format_exc(), language="python")
+
+    if st.session_state.get("latex_source"):
+        with lc2:
+            st.download_button(
+                "⬇ Download .tex file",
+                data=st.session_state["latex_source"],
+                file_name=f"iasl_executive_report_{date.today().isoformat()}.tex",
+                mime="text/x-tex",
+                width="stretch",
+            )
+
+        with st.expander("Preview first 3,000 characters of the .tex source"):
+            st.code(st.session_state["latex_source"][:3000], language="latex")
 
 
 # ---------------------------------------------------------------------------
