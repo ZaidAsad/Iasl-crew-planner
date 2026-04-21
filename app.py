@@ -204,25 +204,19 @@ def render_topbar():
             key="json_uploader",
         )
         if uploaded is not None:
-            try:
-                data = json.loads(uploaded.read().decode("utf-8"))
-                restored = deserialise_state(data)
-                for k, v in restored.items():
-                    st.session_state[k] = v
-                st.success("Plan restored from JSON.")
-            except Exception as e:
-                st.error(f"Failed to load JSON: {e}")
-
-        if st.session_state.get("_autosave_payload"):
-            if st.button("↩ Restore autosave", key="restore_autosave"):
+            # Only restore ONCE per upload — guard against reruns re-applying the file
+            upload_id = f"{uploaded.name}_{uploaded.size}"
+            if st.session_state.get("_last_loaded_upload_id") != upload_id:
                 try:
-                    restored = deserialise_state(st.session_state["_autosave_payload"])
+                    data = json.loads(uploaded.read().decode("utf-8"))
+                    restored = deserialise_state(data)
                     for k, v in restored.items():
                         st.session_state[k] = v
-                    st.success("Autosave restored.")
+                    st.session_state["_last_loaded_upload_id"] = upload_id
+                    st.success(f"Plan restored from {uploaded.name}.")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"Restore failed: {e}")
+                    st.error(f"Failed to load JSON: {e}")
 
     with c3:
         if st.button("🖨 Print PDF", width="stretch", type="primary"):
