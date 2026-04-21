@@ -890,19 +890,6 @@ def _tl_management(d, fleets, funcs):
 def tab_action_planner():
     ss = st.session_state
     d = derived()
-
-    # ---- TEMPORARY DIAGNOSTIC ----
-    with st.expander("🔧 Debug — session state actions list", expanded=True):
-        st.write(f"**Number of actions in ss.actions:** {len(ss.actions)}")
-        st.write(f"**Type of ss.actions:** {type(ss.actions).__name__}")
-        st.write(f"**`id(ss.actions)`:** {id(ss.actions)}")
-        if ss.actions:
-            st.write("**Actions raw:**")
-            for i, a in enumerate(ss.actions):
-                st.write(f"  [{i}] {a.action_type} at month {a.start_month}, id={a.id}")
-        else:
-            st.write("**(empty)**")
-    # ---- END DIAGNOSTIC ----
     
     section_header("Add action")
     action_type = st.selectbox("Action type", ACTION_TYPES, key="new_action_type")
