@@ -113,6 +113,8 @@ class PlannedAction:
     note: str = ""
     new_pilot_name: str = ""
     new_pilot_nationality: str = ""
+    cost: float = 0.0
+    cost_currency: str = "USD"
 
 
 # ---------------------------------------------------------------------------
@@ -629,14 +631,20 @@ def deserialise_state(payload: dict[str, Any]) -> dict[str, Any]:
     v = payload.get("schema_version", 0)
     if v != SCHEMA_VERSION:
         raise ValueError(f"Unsupported schema version {v}. Expected {SCHEMA_VERSION}.")
+
+    def _filter_fields(cls, d: dict) -> dict:
+        import dataclasses
+        valid = {f.name for f in dataclasses.fields(cls)}
+        return {k: v for k, v in d.items() if k in valid}
+
     return {
         "start_year": int(payload["start_year"]),
         "start_month": int(payload["start_month"]),
         "horizon": int(payload["horizon"]),
         "initial_aircraft": {k: int(v) for k, v in payload["initial_aircraft"].items()},
-        "pilots": [Pilot(**p) for p in payload["pilots"]],
-        "fleet_changes": [FleetChange(**c) for c in payload["fleet_changes"]],
-        "actions": [PlannedAction(**a) for a in payload["actions"]],
+        "pilots": [Pilot(**_filter_fields(Pilot, p)) for p in payload["pilots"]],
+        "fleet_changes": [FleetChange(**_filter_fields(FleetChange, c)) for c in payload["fleet_changes"]],
+        "actions": [PlannedAction(**_filter_fields(PlannedAction, a)) for a in payload["actions"]],
     }
 
 
