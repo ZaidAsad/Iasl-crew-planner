@@ -301,20 +301,39 @@ h3 { font-size: 1.1rem; }
     border-radius: 12px;
     border: 1px solid __BORDER__;
     box-shadow: 0 1px 3px rgba(15,41,68,0.04);
+    width: 100%;
+    display: flex;
+    justify-content: stretch;
 }
 .stTabs [data-baseweb="tab"] {
     background: transparent;
     color: __MUTED__;
     border-radius: 8px;
-    padding: 8px 16px;
+    padding: 10px 20px;
     font-weight: 500;
-    font-size: 13px;
+    font-size: 14px;
     border: none;
+    flex: 1;
+    text-align: center;
+    justify-content: center;
+    display: flex;
+    align-items: center;
+    white-space: nowrap;
+    min-width: 0;
 }
 .stTabs [aria-selected="true"] {
     background: __ACCENT__ !important;
     color: white !important;
 }
+.stTabs [data-baseweb="tab"]:hover {
+    background: __ACCENT_SOFT__;
+    color: __ACCENT__;
+}
+.stTabs [aria-selected="true"]:hover {
+    background: #009E91 !important;
+    color: white !important;
+}
+
 
 .stButton > button {
     background: __SURFACE__;
