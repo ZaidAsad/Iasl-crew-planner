@@ -2195,17 +2195,44 @@ def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, 
     activity_months = sorted(m for m in activity_months if 0 <= m <= up_to_month)
 
     # If the horizon has more than 8 activity months, sample to keep readable
-    MAX_COLUMNS = 6
+    # Months that MUST be preserved through sampling — hire arrivals and their pre-arrival columns
+    required_months: set[int] = set()
+    for a in ss.actions:
+        if a.action_type in ("Cadet Hire", "Local Hire", "Expat Hire"):
+            end = a.start_month + a.duration
+            if 0 <= end <= up_to_month:
+                required_months.add(end)
+                if end - 1 >= 0:
+                    required_months.add(end - 1)
+        # Terminations — preserve termination month and month after so the Terminated sink renders
+        if a.action_type == "Pilot Termination":
+            if 0 <= a.start_month <= up_to_month:
+                required_months.add(a.start_month)
+
+    MAX_COLUMNS = 8
     if len(activity_months) > MAX_COLUMNS:
-        step = len(activity_months) / MAX_COLUMNS
-        sampled = [activity_months[int(i * step)] for i in range(MAX_COLUMNS)]
-        if activity_months[-1] not in sampled:
-            sampled[-1] = activity_months[-1]
-        activity_months = sampled
+        # Always keep required_months. Then fill remaining slots by sampling the rest.
+        kept = [m for m in activity_months if m in required_months]
+        remaining_slots = MAX_COLUMNS - len(kept)
+        if remaining_slots > 0:
+            other = [m for m in activity_months if m not in required_months]
+            if other:
+                step = len(other) / remaining_slots
+                sampled_other = [other[min(int(i * step), len(other) - 1)]
+                                 for i in range(remaining_slots)]
+                kept.extend(sampled_other)
+        # Always ensure first and last are kept
+        if activity_months[0] not in kept:
+            kept.append(activity_months[0])
+        if activity_months[-1] not in kept:
+            kept.append(activity_months[-1])
+        activity_months = sorted(set(kept))
+
         info_panel(
-            f"Showing {MAX_COLUMNS} time columns (sampled from "
-            f"{len([a for a in ss.actions if a.start_month <= up_to_month])} "
-            "actions). Narrow your snapshot month on the left to zoom in on fewer transitions.",
+            f"Showing {len(activity_months)} time columns. "
+            "All hire arrivals, their pre-arrival ribbons, and terminations are "
+            "preserved; other intermediate months are sampled. Narrow the snapshot "
+            "month at the top to zoom into a shorter horizon.",
             kind="info",
         )
 
