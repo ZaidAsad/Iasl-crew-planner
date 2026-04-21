@@ -2032,6 +2032,7 @@ def _flow_sankey_classic(d, up_to_month, filt_fleets, filt_funcs, filt_nats, sho
     dst_idx = {combos[i]: i + N for i in range(N)}
     hire_local_idx = 2 * N
     hire_expat_idx = 2 * N + 1
+    terminated_idx = 2 * N + 2
 
     def _node_label(combo, suffix):
         f, fn, nat = combo
@@ -2042,7 +2043,7 @@ def _flow_sankey_classic(d, up_to_month, filt_fleets, filt_funcs, filt_nats, sho
     labels = (
         [_node_label(c, "start") for c in combos]
         + [_node_label(c, "end  ") for c in combos]
-        + ["New hire — Local", "New hire — Expat"]
+        + ["New hire — Local", "New hire — Expat", "Terminated / departed"]
     )
 
     def _node_color(combo):
@@ -2053,9 +2054,9 @@ def _flow_sankey_classic(d, up_to_month, filt_fleets, filt_funcs, filt_nats, sho
     node_colors = (
         [_node_color(c) for c in combos]
         + [_node_color(c) for c in combos]
-        + ["rgba(22,163,74,0.85)", "rgba(220,38,38,0.65)"]
+        + ["rgba(22,163,74,0.85)", "rgba(220,38,38,0.65)", "rgba(100,100,100,0.75)"]
     )
-    node_x = [0.01] * N + [0.99] * N + [0.01, 0.01]
+    node_x = [0.01] * N + [0.99] * N + [0.01, 0.01, 0.99]
 
     pilot_by_id = {p.employee_id: p for p in ss.pilots}
     
@@ -2107,15 +2108,59 @@ def _flow_sankey_classic(d, up_to_month, filt_fleets, filt_funcs, filt_nats, sho
             if a.to_fleet in filt_fleets and a.to_function in filt_funcs and "Expat" in filt_nats:
                 _bump(hire_expat_idx, dst_idx[target], f"Hire: {a.new_pilot_name or 'TBD'}")
 
+    # Terminated pilots — flow from their last-known position to the Terminated sink
+    for pid in terminated:
+        p = pilot_by_id.get(pid)
+        if not p or p.fleet not in FLEETS:
+            continue
+        # Where were they at the moment of termination? Use their original position
+        # unless an earlier-completed action moved them before termination.
+        src_combo = (p.fleet, p.function, p.nationality)
+        # Apply any completed transitions that happened before the termination month
+        for a in sorted(ss.actions, key=lambda x: x.start_month):
+            if a.action_type == "Pilot Termination":
+                continue
+            end = a.start_month + a.duration
+            if pid not in a.trainee_ids or f"SEAT:{pid}" in a.trainee_ids:
+                continue
+            # Find this pilot's termination month
+            term_month = None
+            for ta in ss.actions:
+                if ta.action_type == "Pilot Termination" and pid in ta.trainee_ids:
+                    if term_month is None or ta.start_month < term_month:
+                        term_month = ta.start_month
+            if term_month is None or end > term_month:
+                continue
+            if a.action_type == "Type Rating":
+                src_combo = (a.to_fleet, a.to_function, src_combo[2])
+            elif a.action_type == "Command Upgrade":
+                src_combo = (a.to_fleet, "Captain", src_combo[2])
+
+        if src_combo[0] not in filt_fleets: continue
+        if src_combo[1] not in filt_funcs: continue
+        if src_combo[2] not in filt_nats: continue
+        if src_combo not in src_idx: continue
+        _bump(
+            src_idx[src_combo], terminated_idx,
+            f"{p.employee_id} — {p.full_name} (terminated)",
+        )
+
+    # Non-terminated pilots — normal start → end flows
     for pid, dest in pilot_dest.items():
         p = pilot_by_id.get(pid)
-        if not p or p.fleet not in FLEETS: continue
+        if not p or p.fleet not in FLEETS:
+            continue
         src_combo = (p.fleet, p.function, p.nationality)
-        if show_static and src_combo == dest: continue
-        if not (src_combo[0] in filt_fleets or dest[0] in filt_fleets): continue
-        if not (src_combo[1] in filt_funcs or dest[1] in filt_funcs): continue
-        if p.nationality not in filt_nats: continue
-        if src_combo not in src_idx or dest not in dst_idx: continue
+        if show_static and src_combo == dest:
+            continue
+        if not (src_combo[0] in filt_fleets or dest[0] in filt_fleets):
+            continue
+        if not (src_combo[1] in filt_funcs or dest[1] in filt_funcs):
+            continue
+        if p.nationality not in filt_nats:
+            continue
+        if src_combo not in src_idx or dest not in dst_idx:
+            continue
         _bump(src_idx[src_combo], dst_idx[dest], f"{p.employee_id} — {p.full_name}")
 
     if not flows:
@@ -2164,12 +2209,27 @@ def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, 
     # At each activity month, compute every pilot's position
     pilot_by_id = {p.employee_id: p for p in ss.pilots}
 
+    # Build termination lookup
+    terminated_at: dict[str, int] = {}
+    for a in ss.actions:
+        if a.action_type == "Pilot Termination":
+            for tid in a.trainee_ids:
+                if tid.startswith("TBD"):
+                    continue
+                if tid not in terminated_at or a.start_month < terminated_at[tid]:
+                    terminated_at[tid] = a.start_month
+
     def position_at(pid, month_idx) -> tuple[str, str, str] | None:
+        # Terminated pilots disappear from snapshots AT the termination month
+        if pid in terminated_at and month_idx >= terminated_at[pid]:
+            return None
         p = pilot_by_id.get(pid)
         if not p or p.fleet not in FLEETS:
             return None
         current = (p.fleet, p.function, p.nationality)
         for a in sorted(ss.actions, key=lambda x: x.start_month):
+            if a.action_type == "Pilot Termination":
+                continue
             end = a.start_month + a.duration
             if end > month_idx:
                 continue
@@ -2181,7 +2241,6 @@ def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, 
                 elif a.action_type == "Command Upgrade":
                     current = (a.to_fleet, "Captain", current[2])
         return current
-
     # Also fold in hires as they arrive
     virtual_hires: list[tuple[int, PlannedAction]] = []
     for a in ss.actions:
@@ -2233,6 +2292,22 @@ def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, 
         node_x.append(0.02 + 0.96 * col_pos)
         return idx
 
+    term_node_map: dict[int, int] = {}
+
+    def ensure_terminated_node(month):
+        if month in term_node_map:
+            return term_node_map[month]
+        idx = len(node_ids)
+        term_node_map[month] = idx
+        node_ids.append(f"m{month}_terminated")
+        node_labels.append("Terminated")
+        node_colors.append("rgba(100,100,100,0.75)")
+        col_pos = activity_months.index(month) / max(1, len(activity_months) - 1)
+        node_x.append(0.02 + 0.96 * col_pos)
+        return idx
+
+
+    
     flows: dict[tuple[int, int], dict] = {}
     def _bump(src, dst, desc):
         key = (src, dst)
@@ -2260,21 +2335,30 @@ def _flow_sankey_time_aware(d, up_to_month, filt_fleets, filt_funcs, filt_nats, 
         m0, m1 = activity_months[i], activity_months[i + 1]
         snap0, snap1 = snapshots[m0], snapshots[m1]
 
-        # Pilots present in snap0 — link to their snap1 position if they still exist
+        # Pilots present in snap0 — link to their snap1 position or Terminated sink
         for pid, pos0 in snap0.items():
             # Filter
             if pos0[0] not in filt_fleets: continue
             if pos0[1] not in filt_funcs: continue
             if pos0[2] not in filt_nats: continue
 
+            p = pilot_by_id.get(pid)
+            name = p.full_name if p else pid
+
             pos1 = snap1.get(pid)
-            if pos1 is None: continue
+
+            if pos1 is None:
+                # Pilot disappeared between m0 and m1 — route to Terminated sink at m1
+                if pid in terminated_at and m0 < terminated_at[pid] <= m1:
+                    src = ensure_node(m0, pos0)
+                    dst = ensure_terminated_node(m1)
+                    _bump(src, dst, f"{pid} — {name} (terminated)")
+                continue
+
             if show_static and pos0 == pos1: continue
 
             src = ensure_node(m0, pos0)
             dst = ensure_node(m1, pos1)
-            p = pilot_by_id.get(pid)
-            name = p.full_name if p else pid
             _bump(src, dst, f"{pid} — {name}")
 
         # New hires that arrived in (m0, m1]: link from Hire node at m1
