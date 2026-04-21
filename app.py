@@ -239,15 +239,18 @@ def render_bottom_actions():
                     st.error(f"Failed to load JSON: {e}")
 
     with c3:
-        if st.button("🖨 Generate PDF", width="stretch", type="primary",
-                     help="Build a printable PDF of the full plan."):
-            with st.spinner("Generating PDF…"):
+        if st.button("🖨 Generate PDF (executive)", width="stretch", type="primary",
+                     help="Build an executive-length PDF. For the longer comprehensive report, use the Print Plan tab."):
+            with st.spinner("Generating executive PDF…"):
                 try:
-                    pdf_bytes = build_pdf(current_state_payload())
+                    pdf_bytes = build_pdf(current_state_payload(), mode="executive")
                     st.session_state["pdf_bytes"] = pdf_bytes
+                    st.session_state["pdf_mode"] = "executive"
                     st.success("PDF ready — download below.")
                 except Exception as e:
+                    import traceback
                     st.error(f"PDF generation failed: {e}")
+                    st.code(traceback.format_exc(), language="python")
 
         if st.session_state.get("pdf_bytes"):
             st.download_button(
@@ -2048,22 +2051,45 @@ def tab_print_plan():
         info_panel("No actions planned.")
 
     section_header("Generate PDF")
-    cc1, cc2 = st.columns([1, 3])
+    st.markdown(
+        "Choose a report mode. **Executive** is 8–12 pages with the key visuals "
+        "and summary tables — suited to board/management circulation. "
+        "**Comprehensive** is 20–30+ pages and adds full pilot roster, all "
+        "action detail columns, and a pilot-journey graph for every action — "
+        "suited to operational planning and audit."
+    )
+
+    cc1, cc2, cc3 = st.columns([2, 2, 3])
     with cc1:
+        report_mode = st.radio(
+            "Report mode",
+            ["Executive", "Comprehensive"],
+            horizontal=True,
+            key="pdf_report_mode",
+        )
+
+    with cc2:
         if st.button("🖨 Generate PDF", type="primary", width="stretch"):
-            with st.spinner("Generating PDF…"):
+            with st.spinner(f"Generating {report_mode.lower()} PDF…"):
                 try:
-                    pdf_bytes = build_pdf(current_state_payload())
+                    mode_key = report_mode.lower()
+                    pdf_bytes = build_pdf(current_state_payload(), mode=mode_key)
                     st.session_state["pdf_bytes"] = pdf_bytes
-                    st.success("PDF ready — download below.")
+                    st.session_state["pdf_mode"] = mode_key
+                    st.success(f"{report_mode} PDF ready — download below.")
                 except Exception as e:
+                    import traceback
                     st.error(f"PDF generation failed: {e}")
+                    st.code(traceback.format_exc(), language="python")
 
     if st.session_state.get("pdf_bytes"):
-        st.download_button("⬇ Download generated PDF",
-                           data=st.session_state["pdf_bytes"],
-                           file_name=f"iasl_crew_plan_{date.today().isoformat()}.pdf",
-                           mime="application/pdf")
+        mode_tag = st.session_state.get("pdf_mode", "report")
+        st.download_button(
+            f"⬇ Download {mode_tag} PDF",
+            data=st.session_state["pdf_bytes"],
+            file_name=f"iasl_crew_{mode_tag}_{date.today().isoformat()}.pdf",
+            mime="application/pdf",
+        )
 
 
 # ---------------------------------------------------------------------------
