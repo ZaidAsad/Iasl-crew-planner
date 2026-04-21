@@ -3435,7 +3435,7 @@ def main():
                     "Your plan data is safe. Click **Save JSON** in the top bar "
                     "to download a backup before refreshing the page."
                 )
-
+    render_bottom_actions()
     render_footer()
 
 def render_footer():
