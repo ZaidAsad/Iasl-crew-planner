@@ -921,15 +921,56 @@ def tab_action_planner():
             n_pilots = len(a.trainee_ids)
             title += f"  ·  {n_pilots} pilot{'s' if n_pilots != 1 else ''} departing"
 
+        # Show cost in the title if set
+        cost_val = getattr(a, "cost", 0.0) or 0.0
+        cost_cur = getattr(a, "cost_currency", "USD") or "USD"
+        if cost_val > 0:
+            title += f"  ·  {cost_cur} {cost_val:,.0f}"
+
         with st.expander(title):
             c1, c2 = st.columns([5, 1])
             with c1:
+                trainees_display = []
+                seat_support_display = []
+                for tid in a.trainee_ids:
+                    if tid.startswith("SEAT:"):
+                        seat_support_display.append(tid[5:])
+                    else:
+                        trainees_display.append(tid)
+                trainee_str = ", ".join(trainees_display) if trainees_display else "—"
+                seat_str = ", ".join(seat_support_display) if seat_support_display else ""
                 st.markdown(
                     f"**Duration:** {a.duration}mo  &nbsp; **Mode:** {a.mode}  &nbsp; "
                     f"**Instructor:** {a.instructor_id or '—'}  &nbsp; "
-                    f"**Trainees:** {', '.join(a.trainee_ids) if a.trainee_ids else '—'}"
+                    f"**Trainees:** {trainee_str}"
+                    + (f"  &nbsp; **Seat Support:** {seat_str}" if seat_str else "")
                 )
                 if a.note: st.markdown(f"_{a.note}_")
+
+                # Inline cost editor
+                with st.form(f"cost_edit_{a.id}", clear_on_submit=False):
+                    ec1, ec2, ec3 = st.columns([2, 1, 1])
+                    with ec1:
+                        new_cost = st.number_input(
+                            "Cost",
+                            min_value=0.0, value=float(cost_val), step=1000.0,
+                            format="%.2f", key=f"cost_input_{a.id}",
+                        )
+                    with ec2:
+                        currency_options = ["USD", "EUR", "MVR"]
+                        idx = currency_options.index(cost_cur) if cost_cur in currency_options else 0
+                        new_cur = st.selectbox(
+                            "Currency", currency_options, index=idx,
+                            key=f"cost_cur_{a.id}",
+                        )
+                    with ec3:
+                        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                        if st.form_submit_button("💾 Update cost", width="stretch"):
+                            a.cost = float(new_cost)
+                            a.cost_currency = new_cur
+                            st.success(f"Cost updated to {new_cur} {new_cost:,.0f}")
+                            st.rerun()
+
                 graph = build_cascade_graph(a, ss.pilots, ss.actions)
                 _render_cascade_plot(graph, key_suffix=a.id)
             with c2:
@@ -1045,6 +1086,16 @@ def _form_pilot_termination(d):
         placeholder="Context or replacement plan…",
     )
 
+    cc1, cc2 = st.columns([3, 1])
+    with cc1:
+        cost = st.number_input(
+            "Termination cost (severance, repatriation, etc.)",
+            min_value=0.0, value=0.0, step=1000.0, format="%.2f",
+            key="term_cost",
+        )
+    with cc2:
+        currency = st.selectbox("Currency", ["USD", "EUR", "MVR"], key="term_currency")
+
     submitted = st.form_submit_button("Schedule termination(s)", type="primary")
 
     if submitted:
@@ -1075,6 +1126,8 @@ def _form_pilot_termination(d):
             mode="—",
             trainee_ids=list(selected_pilot_ids),
             note=combined_note,
+            cost=cost * len(selected_pilot_ids),
+            cost_currency=currency,
         )
         ss.actions.append(new_action)
 
@@ -1179,6 +1232,17 @@ def _form_type_rating(d):
 
     note = st.text_input("Note (optional)", key="tr_note")
 
+    cc1, cc2 = st.columns([3, 1])
+    with cc1:
+        cost = st.number_input(
+            "Cost per trainee",
+            min_value=0.0, value=0.0, step=1000.0, format="%.2f",
+            key="tr_cost",
+            help="Cost in currency units. Total cost = this × number of trainees.",
+        )
+    with cc2:
+        currency = st.selectbox("Currency", ["USD", "EUR", "MVR"], key="tr_currency")
+
     if st.form_submit_button("Add Type Rating", type="primary"):
         # Collect candidates
         candidates = []
@@ -1243,12 +1307,13 @@ def _form_type_rating(d):
             ss.actions.append(PlannedAction(
                 id=new_id("act"), action_type="Type Rating",
                 start_month=start, duration=duration, mode=mode,
-                # Instructor attached only to the first action in the cohort
                 instructor_id="" if first_emitted else instructor,
                 trainee_ids=list(trainees),
                 from_fleet=origin_fleet, from_function=from_fn,
                 to_fleet=to_fleet, to_function=to_fn,
                 note=(note + f"  [cohort {cohort_tag}]").strip(),
+                cost=cost * len(trainees),
+                cost_currency=currency,
             ))
             first_emitted = True
             added += 1
@@ -1278,6 +1343,8 @@ def _form_type_rating(d):
                         from_fleet=origin, from_function="",
                         to_fleet=to_fleet, to_function="",
                         note=(note + f"  [seat support only, cohort {cohort_tag}]").strip(),
+                        cost=cost * len(pids),
+                        cost_currency=currency,
                     ))
                     first_emitted = True
                     added += 1
@@ -1326,6 +1393,16 @@ def _form_command_upgrade(d):
 
     note = st.text_input("Note (optional)", key="cu_note")
 
+    cc1, cc2 = st.columns([3, 1])
+    with cc1:
+        cost = st.number_input(
+            "Cost per candidate",
+            min_value=0.0, value=0.0, step=1000.0, format="%.2f",
+            key="cu_cost",
+        )
+    with cc2:
+        currency = st.selectbox("Currency", ["USD", "EUR", "MVR"], key="cu_currency")
+
     if st.form_submit_button("Add Command Upgrade", type="primary"):
         if not trainees:
             st.error("Pick at least one candidate.")
@@ -1342,6 +1419,8 @@ def _form_command_upgrade(d):
                 instructor_id=instructor, trainee_ids=trainees,
                 from_fleet=from_fleet, from_function=from_function,
                 to_fleet=to_fleet, to_function="Captain", note=note,
+                cost=cost * len(trainees),
+                cost_currency=currency,
             ))
             st.success("Command Upgrade added."); st.rerun()
 
@@ -1366,6 +1445,16 @@ def _form_hire(d, kind: str):
                                key=f"hire_dur_{kind}")
     note = st.text_input("Note (optional)", key=f"hire_note_{kind}")
 
+    cc1, cc2 = st.columns([3, 1])
+    with cc1:
+        cost = st.number_input(
+            "Hiring cost (recruitment + onboarding + training)",
+            min_value=0.0, value=0.0, step=1000.0, format="%.2f",
+            key=f"hire_cost_{kind}",
+        )
+    with cc2:
+        currency = st.selectbox("Currency", ["USD", "EUR", "MVR"], key=f"hire_currency_{kind}")
+
     if st.form_submit_button(f"Add {kind}", type="primary"):
         if not name.strip():
             st.error("Name is required (use TBD if unknown).")
@@ -1377,6 +1466,7 @@ def _form_hire(d, kind: str):
                 to_fleet=to_fleet, to_function=to_function,
                 new_pilot_name=name.strip(),
                 new_pilot_nationality=nat, note=note,
+                cost=cost, cost_currency=currency,
             ))
             st.success(f"{kind} added."); st.rerun()
 
@@ -1388,6 +1478,17 @@ def _form_fleet_change(d):
     with c2: action = st.selectbox("Action", ["Acquire", "Dispose"], key="fch_action")
     with c3: start = _month_selector(d, "fch_start")
     note = st.text_input("Note", key="fch_note")
+
+    cc1, cc2 = st.columns([3, 1])
+    with cc1:
+        cost = st.number_input(
+            "Cost (acquisition / disposal / transition)",
+            min_value=0.0, value=0.0, step=100000.0, format="%.2f",
+            key="fch_cost",
+        )
+    with cc2:
+        currency = st.selectbox("Currency", ["USD", "EUR", "MVR"], key="fch_currency")
+
     if st.form_submit_button("Add Fleet Change", type="primary"):
         delta = 1 if action == "Acquire" else -1
         ss.fleet_changes.append(FleetChange(
@@ -1397,6 +1498,7 @@ def _form_fleet_change(d):
             id=new_id("act"), action_type="Fleet Change",
             start_month=start, duration=0, mode="—",
             from_fleet=fleet, note=f"{action} 1× {fleet}. {note}".strip(),
+            cost=cost, cost_currency=currency,
         ))
         st.success(f"{action} 1× {fleet} scheduled."); st.rerun()
 
@@ -1732,14 +1834,17 @@ def _build_optimiser_prompt(state, derived_data, objectives, extra_notes) -> str
         buf.write("ALREADY-PLANNED ACTIONS (treat as fixed):\n\n")
         for a in sorted(actions, key=lambda x: x.start_month):
             mo = labels[a.start_month] if 0 <= a.start_month < len(labels) else f"M{a.start_month}"
+            cost_val = getattr(a, "cost", 0.0) or 0.0
+            cost_cur = getattr(a, "cost_currency", "USD") or "USD"
+            cost_str = f"cost={cost_cur} {cost_val:,.0f}" if cost_val > 0 else "cost=—"
             buf.write(
                 f"  {mo} | {a.action_type} | "
                 f"from {a.from_fleet} {a.from_function} -> to {a.to_fleet} {a.to_function} | "
                 f"{a.duration}mo | mode={a.mode} | instructor={a.instructor_id or '—'} | "
-                f"trainees={','.join(a.trainee_ids) if a.trainee_ids else '—'} | {a.note}\n"
+                f"trainees={','.join(a.trainee_ids) if a.trainee_ids else '—'} | {cost_str} | {a.note}\n"
             )
         buf.write("\n")
-
+        
     if extra_notes:
         buf.write("=" * 70 + "\nADDITIONAL INSTRUCTIONS\n" + "=" * 70 + "\n\n")
         buf.write(extra_notes + "\n\n")
@@ -1871,22 +1976,35 @@ def tab_print_plan():
         "cascade diagrams, and localisation roadmap.", kind="info",
     )
 
-    c1, c2, c3, c4 = st.columns(4)
+    # Compute total cost across all actions, per currency
+    totals: dict[str, float] = {}
+    for a in ss.actions:
+        cv = getattr(a, "cost", 0.0) or 0.0
+        cc = getattr(a, "cost_currency", "USD") or "USD"
+        if cv > 0:
+            totals[cc] = totals.get(cc, 0.0) + cv
+    cost_summary = ", ".join(f"{cur} {v:,.0f}" for cur, v in sorted(totals.items())) or "—"
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1: metric_card("Pilots", len(ss.pilots))
     with c2: metric_card("Aircraft", sum(ss.initial_aircraft.values()))
     with c3: metric_card("Actions", len(ss.actions))
     with c4: metric_card("Fleet changes", len(ss.fleet_changes))
-
+    with c5: metric_card("Total cost", cost_summary, "across all actions")
+        
     section_header("Action summary")
     if ss.actions:
         rows = []
         for a in sorted(ss.actions, key=lambda x: x.start_month):
             mo = d["labels"][a.start_month] if 0 <= a.start_month < len(d["labels"]) else f"M{a.start_month}"
+            cost_val = getattr(a, "cost", 0.0) or 0.0
+            cost_cur = getattr(a, "cost_currency", "USD") or "USD"
+            cost_display = f"{cost_cur} {cost_val:,.0f}" if cost_val > 0 else "—"
             rows.append({
                 "Month": mo, "Type": a.action_type,
-                "From": f"{a.from_fleet} {a.from_function}".strip(),
-                "To": f"{a.to_fleet} {a.to_function}".strip(),
-                "Mode": a.mode, "Duration": f"{a.duration}mo",
+                "From": from_display, "To": to_display,
+                "Mode": a.mode, "Duration": f"{a.duration}mo" if a.duration else "—",
+                "Cost": cost_display,
             })
         st.dataframe(_safe_df(rows), hide_index=True, width="stretch")
     else:
@@ -2557,6 +2675,32 @@ def _render_localisation_strip(activity_months, column_positions, labels_by_mont
     """
     ss = st.session_state
 
+    # Compute per-column and cumulative costs — costs attribute to the month the
+    # action STARTS (that's when funds are committed / PO issued).
+    cost_per_col: dict[int, dict[str, float]] = {m: {} for m in activity_months}
+    for a in ss.actions:
+        cost_val = getattr(a, "cost", 0.0) or 0.0
+        cost_cur = getattr(a, "cost_currency", "USD") or "USD"
+        if cost_val <= 0:
+            continue
+        # Find the activity column this cost attributes to — it's the LAST
+        # activity month that is <= a.start_month.
+        eligible = [m for m in activity_months if m <= a.start_month]
+        if not eligible:
+            # Action starts before first column — attribute to first column
+            target_m = activity_months[0]
+        else:
+            target_m = max(eligible)
+        cost_per_col[target_m][cost_cur] = cost_per_col[target_m].get(cost_cur, 0.0) + cost_val
+
+    # Cumulative per currency
+    cumulative_per_col: dict[int, dict[str, float]] = {}
+    running: dict[str, float] = {}
+    for m in activity_months:
+        for cur, v in cost_per_col[m].items():
+            running[cur] = running.get(cur, 0.0) + v
+        cumulative_per_col[m] = dict(running)
+
     # Build terminated lookup so post-termination counts are accurate
     terminated_at: dict[str, int] = {}
     for a in ss.actions:
@@ -2772,6 +2916,48 @@ def _render_localisation_strip(activity_months, column_positions, labels_by_mont
         "The large percentage is the overall local share across all four fleets; "
         "the mini-bars show per-fleet local share. Colour-coded: green ≥ 80%, "
         "amber 50–79%, red < 50%."
+    )
+
+    # Cost strip — two HTML rows aligned with the columns
+    def _fmt_cost(d: dict[str, float]) -> str:
+        if not d:
+            return "<span style='color:#94a3b8'>—</span>"
+        return "<br>".join(f"<b>{cur}</b> {v:,.0f}" for cur, v in sorted(d.items()))
+
+    col_count = len(activity_months)
+    if col_count == 0:
+        return
+
+    cell_style = (
+        f"flex:1; padding:10px 8px; border:1px solid {COLORS['border']}; "
+        f"border-radius:8px; background:{COLORS['surface']}; "
+        "font-size:11px; text-align:center; min-width:0;"
+    )
+    row_style = "display:flex; gap:6px; margin-top:6px; align-items:stretch;"
+
+    def _row_html(label: str, cell_contents: list[str], label_color: str) -> str:
+        cells = "".join(f"<div style='{cell_style}'>{c}</div>" for c in cell_contents)
+        label_cell = (
+            f"<div style='flex:0 0 140px; padding:10px 8px; font-size:11px; "
+            f"font-weight:600; color:{label_color}; "
+            f"display:flex; align-items:center;'>{label}</div>"
+        )
+        return f"<div style='{row_style}'>{label_cell}{cells}</div>"
+
+    per_col_cells = [_fmt_cost(cost_per_col[m]) for m in activity_months]
+    cum_cells = [_fmt_cost(cumulative_per_col[m]) for m in activity_months]
+
+    section_header("Cost tracking at each time column")
+    st.markdown(
+        _row_html("Cost incurred this period", per_col_cells, COLORS["accent"])
+        + _row_html("Cumulative cost to date", cum_cells, COLORS["navy"]),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Costs attribute to the most recent activity column that is on or "
+        "before the action's start month. Multi-currency plans display each "
+        "currency on its own line. Cumulative row sums from the start of the "
+        "horizon through the current column, inclusive."
     )
 
 
