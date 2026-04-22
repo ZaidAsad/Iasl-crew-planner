@@ -9,6 +9,12 @@ import io as _io
 import json
 from datetime import date, datetime
 
+from optimiser_engine import (
+    OptimiserGoal, OptimiserWeights, OptimiserConfig,
+    SolverProgress, OptimiserResult,
+    solve as optimiser_solve,
+    EXPAT_MONTHLY_MVR, LOCAL_MONTHLY_MVR, MVR_PER_USD,
+)
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -4033,6 +4039,644 @@ def _render_expat_detail_table(filtered, d):
     st.dataframe(_safe_df(df), hide_index=True, height=min(500, 40 * len(rows) + 60),
                  width="stretch")
 
+# ---------------------------------------------------------------------------
+# TAB — Strategic Optimiser
+# ---------------------------------------------------------------------------
+def tab_optimiser():
+    """
+    Strategic optimisation engine: user sets targets (goals) + weights, solver
+    finds the minimum-weighted-cost action plan satisfying the goals under the
+    career-progression constraints.
+    """
+    ss = st.session_state
+    d = derived()
+
+    section_header("Strategic Planning Optimiser")
+    info_panel(
+        "A mixed-integer linear programme that takes your current crew state "
+        "and finds a cost-optimal sequence of training, hiring, and termination "
+        "actions to hit the targets you specify. The solver respects the career "
+        "progression ladder (DHC-8/ATR → A320 FO → A330 FO → Captain tracks), "
+        "restricts command upgrades and fleet transfers to locals, and uses "
+        "expatriates only as bridges while locals are trained. Results are "
+        "previewed before being merged into your plan.",
+        kind="info",
+    )
+
+    # -----------------------------------------------------------------
+    # Initialise UI state
+    # -----------------------------------------------------------------
+    if "opt_goals" not in ss:
+        ss.opt_goals = []
+    if "opt_result" not in ss:
+        ss.opt_result = None
+    if "opt_fast_result" not in ss:
+        ss.opt_fast_result = None
+    if "opt_pareto_points" not in ss:
+        ss.opt_pareto_points = []
+    if "opt_stop_requested" not in ss:
+        ss.opt_stop_requested = False
+
+    # -----------------------------------------------------------------
+    # Step 1: Define goals
+    # -----------------------------------------------------------------
+    section_header("Step 1 — Define your goals")
+    st.markdown(
+        "Each goal specifies an end-state for one (fleet × function) cell: "
+        "total pilots required, how many must be local, how many expats are "
+        "allowed. Target date is when this end-state must be achieved. You can "
+        "add multiple goals — the solver will try to satisfy them all together."
+    )
+
+    with st.form("opt_add_goal", clear_on_submit=True):
+        g1, g2, g3 = st.columns(3)
+        with g1:
+            goal_fleet = st.selectbox("Fleet", FLEETS, key="opt_goal_fleet")
+        with g2:
+            goal_fn = st.selectbox("Function", FUNCTIONS, key="opt_goal_fn")
+        with g3:
+            goal_priority = st.selectbox(
+                "Priority",
+                ["must (hard constraint)", "nice (soft, large penalty)"],
+                key="opt_goal_priority",
+            )
+
+        g4, g5, g6, g7 = st.columns(4)
+        with g4:
+            goal_month = st.selectbox(
+                "Target by month",
+                options=list(range(ss.horizon)),
+                format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}",
+                index=min(11, ss.horizon - 1),
+                key="opt_goal_month",
+            )
+        with g5:
+            goal_total = st.number_input(
+                "Total pilots required", min_value=0, max_value=200, value=10,
+                key="opt_goal_total",
+            )
+        with g6:
+            goal_min_locals = st.number_input(
+                "Minimum locals", min_value=0, max_value=200, value=6,
+                key="opt_goal_min_locals",
+            )
+        with g7:
+            goal_max_expats = st.number_input(
+                "Maximum expats", min_value=0, max_value=200, value=4,
+                key="opt_goal_max_expats",
+            )
+
+        if st.form_submit_button("➕ Add goal", type="primary"):
+            if goal_min_locals + goal_max_expats < goal_total:
+                st.error(
+                    "min_locals + max_expats must be ≥ total. "
+                    f"Currently {goal_min_locals} + {goal_max_expats} = "
+                    f"{goal_min_locals + goal_max_expats}, but total is {goal_total}."
+                )
+            else:
+                priority_key = "must" if goal_priority.startswith("must") else "nice"
+                ss.opt_goals.append(OptimiserGoal(
+                    fleet=goal_fleet,
+                    function=goal_fn,
+                    target_month=int(goal_month),
+                    target_total=int(goal_total),
+                    max_expats=int(goal_max_expats),
+                    min_locals=int(goal_min_locals),
+                    priority=priority_key,
+                ))
+                st.success(f"Goal added: {goal_fleet} {goal_fn} by {d['labels'][goal_month]}")
+                st.rerun()
+
+    if ss.opt_goals:
+        section_header(f"Current goals ({len(ss.opt_goals)})")
+        for i, g in enumerate(ss.opt_goals):
+            gc1, gc2 = st.columns([10, 1])
+            with gc1:
+                label = d["labels"][g.target_month] if 0 <= g.target_month < len(d["labels"]) else f"M{g.target_month}"
+                priority_badge = pill(g.priority.upper(),
+                                      "accent" if g.priority == "must" else "amber")
+                st.markdown(
+                    f"{priority_badge} &nbsp; <b>{g.fleet} {g.function}</b> "
+                    f"by <b>{label}</b>: at least <b>{g.target_total}</b> pilots "
+                    f"(≥ <b>{g.min_locals}</b> local, ≤ <b>{g.max_expats}</b> expat)",
+                    unsafe_allow_html=True,
+                )
+            with gc2:
+                if st.button("✕", key=f"del_goal_{i}"):
+                    ss.opt_goals.pop(i)
+                    st.rerun()
+    else:
+        info_panel("No goals defined yet. Add at least one above.", kind="warn")
+        return
+
+    # -----------------------------------------------------------------
+    # Step 2: Weights
+    # -----------------------------------------------------------------
+    section_header("Step 2 — Tune objective weights")
+    st.markdown(
+        "These weights determine the trade-off the optimiser makes. Higher "
+        "shortfall weight forces it to meet crew requirements every month. "
+        "Higher expat weight accelerates localisation. Negative local-added "
+        "weight rewards the solver for promoting / hiring locals."
+    )
+
+    wc1, wc2, wc3 = st.columns(3)
+    with wc1:
+        w_cost = st.slider(
+            "Cost weight", 0.0, 5.0, 1.0, 0.1, key="opt_w_cost",
+            help="Weight on total MVR cost of training + hiring + termination.",
+        )
+        w_expat = st.slider(
+            "Expat-months weight", 0, 20000, 5000, 500, key="opt_w_expat",
+            help="Penalty per month an expatriate remains on the roster.",
+        )
+    with wc2:
+        w_short_millions = st.slider(
+            "Shortfall weight (×1M)", 1, 100, 10, 1, key="opt_w_short",
+            help="Very large penalty per pilot-month of unmet requirement. "
+                 "Keep high unless shortfall is tolerable.",
+        )
+        w_local = st.slider(
+            "Local-added bonus (negative)", -2_000_000, 0, -500_000, 50_000,
+            key="opt_w_local",
+            help="Negative = bonus awarded per new local added to roster.",
+        )
+    with wc3:
+        w_time = st.slider(
+            "Time-to-target weight", 0, 500_000, 50_000, 10_000, key="opt_w_time",
+            help="Soft penalty on achieving targets late.",
+        )
+
+    weights = OptimiserWeights(
+        cost=w_cost,
+        expat_months=float(w_expat),
+        shortfall=float(w_short_millions) * 1_000_000,
+        local_added=float(w_local),
+        time_to_target=float(w_time),
+    )
+
+    # -----------------------------------------------------------------
+    # Step 3: Solver config
+    # -----------------------------------------------------------------
+    section_header("Step 3 — Solver configuration")
+
+    cc1, cc2, cc3 = st.columns(3)
+    with cc1:
+        mode = st.radio(
+            "Solve mode",
+            ["Fast (30s)", "Deep (10 min)", "Fast → then Deep"],
+            key="opt_mode",
+            help="Fast gives a workable plan quickly. Deep runs longer for a "
+                 "higher-quality solution. Fast→Deep does both in sequence.",
+        )
+    with cc2:
+        max_conc = st.slider(
+            "Max concurrent trainings per fleet", 1, 6, 2, key="opt_max_conc",
+        )
+        allow_term = st.checkbox("Allow expat terminations", value=True, key="opt_allow_term")
+    with cc3:
+        allow_expat_hires = st.checkbox(
+            "Allow expat hires", value=True, key="opt_allow_expat_hires",
+            help="If off, only locals can be hired (ATR FO cadets only).",
+        )
+        run_pareto = st.checkbox(
+            "Compute cost-vs-localisation Pareto",
+            value=False, key="opt_run_pareto",
+            help="Runs the solver multiple times with different weight blends "
+                 "to produce a Pareto frontier. Multiplies total solve time.",
+        )
+
+    # -----------------------------------------------------------------
+    # Step 4: Solve
+    # -----------------------------------------------------------------
+    section_header("Step 4 — Run the optimiser")
+
+    sc1, sc2, sc3 = st.columns([2, 2, 4])
+    with sc1:
+        run_clicked = st.button("🚀 Run optimiser", type="primary", width="stretch",
+                                key="opt_run")
+    with sc2:
+        if st.button("⏹ Stop solver", width="stretch", key="opt_stop"):
+            ss.opt_stop_requested = True
+            st.warning("Stop requested — will take effect at next checkpoint.")
+    with sc3:
+        st.caption(
+            "The solver may take anywhere from a few seconds to several minutes "
+            "depending on horizon length, number of pilots, and number of goals. "
+            "Click Stop to surrender early and keep the best-so-far result."
+        )
+
+    if run_clicked:
+        _run_optimiser_with_progress(
+            state=current_state_payload(),
+            goals=ss.opt_goals,
+            weights=weights,
+            mode=mode,
+            max_conc=max_conc,
+            allow_term=allow_term,
+            allow_expat_hires=allow_expat_hires,
+            run_pareto=run_pareto,
+        )
+
+    # -----------------------------------------------------------------
+    # Step 5: Results display
+    # -----------------------------------------------------------------
+    if ss.opt_result is not None:
+        _render_optimiser_result(ss.opt_result, d)
+
+    if ss.opt_pareto_points:
+        _render_pareto_frontier(ss.opt_pareto_points, d)
+
+
+def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
+                                 allow_term, allow_expat_hires, run_pareto):
+    """Execute solver with progress UI. Updates session state with result."""
+    ss = st.session_state
+    ss.opt_stop_requested = False
+
+    progress_container = st.container()
+
+    with progress_container:
+        st.markdown("### Solver progress")
+        phase_placeholder = st.empty()
+        bar = st.progress(0)
+        stats_placeholder = st.empty()
+        log_placeholder = st.empty()
+
+    log_lines: list[str] = []
+
+    def progress_cb(p: SolverProgress):
+        phase_placeholder.markdown(f"**Phase:** {p.phase}")
+        # Progress bar — approximate fraction of time limit
+        time_limit = (30 if mode.startswith("Fast") and not mode.startswith("Fast →") else 600)
+        if mode.startswith("Fast →"):
+            time_limit = 30 if "Deep" not in log_lines[-1:] else 600
+        frac = min(1.0, p.elapsed_seconds / max(1, time_limit))
+        bar.progress(frac)
+
+        stats = []
+        stats.append(f"⏱ {p.elapsed_seconds:.1f}s")
+        if p.incumbent_value is not None:
+            stats.append(f"📉 incumbent: {p.incumbent_value:,.0f}")
+        if p.best_bound is not None:
+            stats.append(f"📈 bound: {p.best_bound:,.0f}")
+        if p.gap_percent is not None:
+            stats.append(f"Δ {p.gap_percent:.2f}%")
+        stats_placeholder.markdown(" &nbsp;&nbsp; ".join(stats))
+
+        log_lines.append(f"[{p.elapsed_seconds:.1f}s] {p.phase}: {p.message}")
+        log_placeholder.code("\n".join(log_lines[-10:]), language="text")
+
+    def should_stop():
+        return ss.opt_stop_requested
+
+    # ------------ Execute ------------
+    if run_pareto:
+        ss.opt_pareto_points = _run_pareto(
+            state, goals, weights, max_conc, allow_term, allow_expat_hires,
+            progress_cb,
+        )
+        phase_placeholder.markdown("**Phase:** Pareto done")
+        bar.progress(1.0)
+
+    if mode.startswith("Fast") or mode.startswith("Fast →"):
+        config_fast = OptimiserConfig(
+            mode="fast",
+            time_limit_seconds=30,
+            max_concurrent_trainings_per_fleet=max_conc,
+            allow_expat_hires=allow_expat_hires,
+            allow_terminations=allow_term,
+        )
+        fast_result = optimiser_solve(
+            state, goals, weights, config_fast, progress_cb, should_stop,
+        )
+        ss.opt_fast_result = fast_result
+        ss.opt_result = fast_result
+
+    if mode.startswith("Deep") or mode.startswith("Fast →"):
+        if ss.opt_stop_requested:
+            return
+        phase_placeholder.markdown("**Phase:** Deep solve starting…")
+        log_lines.append("Deep phase: expanding time budget to 600s")
+        config_deep = OptimiserConfig(
+            mode="deep",
+            time_limit_seconds=600,
+            max_concurrent_trainings_per_fleet=max_conc,
+            allow_expat_hires=allow_expat_hires,
+            allow_terminations=allow_term,
+        )
+        deep_result = optimiser_solve(
+            state, goals, weights, config_deep, progress_cb, should_stop,
+        )
+        # Only replace the Fast result if Deep found something better
+        if (deep_result.status in ("optimal", "feasible", "not_solved")
+                and deep_result.objective_value is not None
+                and (ss.opt_result is None
+                     or ss.opt_result.objective_value is None
+                     or deep_result.objective_value < ss.opt_result.objective_value)):
+            ss.opt_result = deep_result
+
+    bar.progress(1.0)
+    phase_placeholder.markdown("**Phase:** Complete ✓")
+
+
+def _run_pareto(state, goals, base_weights, max_conc, allow_term, allow_expat_hires,
+                progress_cb) -> list[dict]:
+    """
+    Compute a cost-vs-localisation Pareto frontier by solving at several
+    weight blends. Returns list of {cost, local_count, obj, actions}.
+    """
+    points = []
+    # Sample 5 weight configurations
+    grid = [
+        ("Cost-first", 1.0, -100_000),
+        ("Balanced", 1.0, -500_000),
+        ("Local-pref", 1.0, -1_000_000),
+        ("Local-heavy", 0.5, -1_500_000),
+        ("Maximal localisation", 0.2, -2_000_000),
+    ]
+    for label, w_cost_mul, w_local_val in grid:
+        w = OptimiserWeights(
+            cost=base_weights.cost * w_cost_mul,
+            expat_months=base_weights.expat_months,
+            shortfall=base_weights.shortfall,
+            local_added=w_local_val,
+            time_to_target=base_weights.time_to_target,
+        )
+        cfg = OptimiserConfig(
+            mode="fast",
+            time_limit_seconds=20,
+            max_concurrent_trainings_per_fleet=max_conc,
+            allow_expat_hires=allow_expat_hires,
+            allow_terminations=allow_term,
+        )
+        r = optimiser_solve(state, goals, w, cfg, progress_cb, lambda: False)
+        if r.objective_value is not None:
+            total_cost = sum(
+                (getattr(a, "cost", 0) or 0) for a in r.actions
+            )
+            n_local_moves = sum(
+                1 for a in r.actions
+                if a.action_type in ("Type Rating", "Command Upgrade", "Cadet Hire", "Local Hire")
+            )
+            points.append({
+                "label": label,
+                "cost_mvr": total_cost,
+                "local_moves": n_local_moves,
+                "objective": r.objective_value,
+                "actions": r.actions,
+                "status": r.status,
+            })
+    return points
+
+
+def _render_optimiser_result(result: OptimiserResult, d: dict):
+    """Render solver result with stats, Gantt, and apply button."""
+    ss = st.session_state
+    section_header("Solver result")
+
+    # Top stats
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        status_badge = {
+            "optimal":    ("OPTIMAL", "green"),
+            "feasible":   ("FEASIBLE", "amber"),
+            "not_solved": ("TIMED OUT", "amber"),
+            "infeasible": ("INFEASIBLE", "red"),
+            "error":      ("ERROR", "red"),
+        }.get(result.status, (result.status.upper(), "muted"))
+        metric_card("Status", status_badge[0], "solver outcome")
+    with c2:
+        obj = f"{result.objective_value:,.0f}" if result.objective_value is not None else "—"
+        metric_card("Objective value", obj, "lower is better")
+    with c3:
+        metric_card("Elapsed", f"{result.elapsed_seconds:.1f}s",
+                    f"{len(result.actions)} actions proposed")
+    with c4:
+        total_short = sum(sum(s) for s in result.per_month_shortfall.values())
+        metric_card("Total shortfall", f"{total_short:.1f}", "pilot-months short")
+
+    # Explanation
+    with st.expander("Solver explanation", expanded=(result.status != "optimal")):
+        st.markdown(result.explanation)
+        if result.diagnostics:
+            st.json(result.diagnostics)
+
+    if not result.actions:
+        info_panel("No actions were proposed. Your goals may already be met "
+                   "by your current plan, or the problem was infeasible.",
+                   kind="warn")
+        return
+
+    # Gantt of proposed actions
+    section_header("Proposed actions — Gantt preview")
+    _render_optimiser_gantt(result.actions, d)
+
+    # Table
+    section_header(f"Proposed actions — list ({len(result.actions)})")
+    rows = []
+    pilot_by_id = {p.employee_id: p for p in ss.pilots}
+    for a in result.actions:
+        mo = d["labels"][a.start_month] if 0 <= a.start_month < len(d["labels"]) else f"M{a.start_month}"
+        trainee_names = []
+        for t in a.trainee_ids[:3]:
+            p = pilot_by_id.get(t)
+            trainee_names.append(p.full_name if p else t)
+        trainees_str = ", ".join(trainee_names)
+        if len(a.trainee_ids) > 3:
+            trainees_str += f" +{len(a.trainee_ids) - 3} more"
+
+        detail = ""
+        if a.action_type in ("Type Rating", "Command Upgrade"):
+            detail = f"{a.from_fleet} {a.from_function} → {a.to_fleet} {a.to_function}"
+        elif a.action_type in ("Cadet Hire", "Expat Hire", "Local Hire"):
+            detail = f"→ {a.to_fleet} {a.to_function} ({a.new_pilot_nationality})"
+
+        cost_val = getattr(a, "cost", 0) or 0
+        cost_cur = getattr(a, "cost_currency", "MVR")
+        cost_str = f"{cost_cur} {cost_val:,.0f}" if cost_val > 0 else "—"
+
+        rows.append({
+            "Month": mo,
+            "Type": a.action_type,
+            "Detail": detail,
+            "Duration": f"{a.duration}mo" if a.duration else "—",
+            "Pilots": trainees_str,
+            "Cost": cost_str,
+        })
+    st.dataframe(_safe_df(rows), hide_index=True, height=400, width="stretch")
+
+    # Apply / reject
+    section_header("Apply these actions to your plan?")
+    st.markdown(
+        "Applying will merge the optimiser-generated actions into your main "
+        "plan. They'll appear in the Action Planner and be included in all "
+        "downstream views, reports, and exports. Existing actions are not "
+        "removed — only added to. You can remove individual ones later."
+    )
+    ac1, ac2, ac3 = st.columns([2, 2, 4])
+    with ac1:
+        if st.button("✓ Apply all actions", type="primary", width="stretch",
+                     key="opt_apply"):
+            for a in result.actions:
+                ss.actions.append(a)
+            st.success(f"Added {len(result.actions)} actions to your plan.")
+            ss.opt_result = None
+            st.rerun()
+    with ac2:
+        if st.button("✗ Discard result", width="stretch", key="opt_discard"):
+            ss.opt_result = None
+            ss.opt_fast_result = None
+            st.rerun()
+    with ac3:
+        st.caption(
+            "You can also apply a subset by discarding and re-running with "
+            "tighter or looser goals to get a plan closer to what you want."
+        )
+
+
+def _render_optimiser_gantt(actions, d):
+    """Gantt chart of proposed actions using plotly."""
+    ss = st.session_state
+    labels = d["labels"]
+    pilot_by_id = {p.employee_id: p for p in ss.pilots}
+
+    color_map = {
+        "Type Rating": COLORS["blue"],
+        "Command Upgrade": COLORS["violet"],
+        "Cadet Hire": COLORS["green"],
+        "Local Hire": COLORS["green"],
+        "Expat Hire": COLORS["amber"],
+        "Pilot Termination": COLORS["red"],
+        "Fleet Change": COLORS["accent"],
+    }
+
+    fig = go.Figure()
+    sorted_actions = sorted(actions, key=lambda a: a.start_month)
+    for i, a in enumerate(sorted_actions):
+        dur = max(0.5, a.duration if a.duration else 0.6)
+        start_lbl = labels[a.start_month] if 0 <= a.start_month < len(labels) else "?"
+        end_idx = min(a.start_month + int(round(dur)), len(labels) - 1)
+        end_lbl = labels[end_idx]
+        col = color_map.get(a.action_type, COLORS["muted"])
+
+        pilots_str = ", ".join(
+            pilot_by_id.get(t, Pilot(
+                employee_id=t, full_name=t, nationality="", fleet="",
+                function="", designations=[], management=False, status="",
+            )).full_name for t in a.trainee_ids[:3]
+        )
+        if len(a.trainee_ids) > 3:
+            pilots_str += f" +{len(a.trainee_ids) - 3}"
+
+        hover_text = (
+            f"<b>{a.action_type}</b><br>"
+            f"{start_lbl} → {end_lbl}<br>"
+        )
+        if a.from_fleet:
+            hover_text += f"{a.from_fleet} {a.from_function} → {a.to_fleet} {a.to_function}<br>"
+        if pilots_str:
+            hover_text += f"Pilots: {pilots_str}<br>"
+        cost_v = getattr(a, "cost", 0) or 0
+        if cost_v > 0:
+            cost_c = getattr(a, "cost_currency", "MVR")
+            hover_text += f"Cost: {cost_c} {cost_v:,.0f}"
+
+        fig.add_trace(go.Scatter(
+            x=[start_lbl, end_lbl], y=[i, i],
+            mode="lines",
+            line=dict(color=col, width=14),
+            opacity=0.88,
+            hovertext=hover_text,
+            hoverinfo="text",
+            showlegend=False,
+        ))
+
+    # Y labels
+    y_labels = []
+    for a in sorted_actions:
+        detail = ""
+        if a.action_type in ("Type Rating", "Command Upgrade"):
+            detail = f"{a.from_fleet}→{a.to_fleet}"
+        elif a.action_type in ("Cadet Hire", "Expat Hire", "Local Hire"):
+            detail = f"→{a.to_fleet} {a.to_function[:3]}"
+        y_labels.append(f"{a.action_type} · {detail}")
+
+    fig.update_layout(
+        height=max(300, len(sorted_actions) * 28 + 80),
+        yaxis=dict(
+            tickvals=list(range(len(sorted_actions))),
+            ticktext=y_labels,
+            autorange="reversed",
+            tickfont=dict(size=10),
+        ),
+        xaxis=dict(tickangle=-45, gridcolor=COLORS["border"]),
+        margin=dict(l=250, r=30, t=20, b=100),
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_pareto_frontier(points, d):
+    section_header("Cost vs localisation Pareto frontier")
+    st.markdown(
+        "Each point is a different weight blend; the solver was run once per "
+        "point. Points closer to the bottom-right are better — lower cost, "
+        "more local pilot moves. Hover for details."
+    )
+
+    if not points:
+        info_panel("No Pareto points available.", kind="warn")
+        return
+
+    fig = go.Figure()
+    for p in points:
+        fig.add_trace(go.Scatter(
+            x=[p["cost_mvr"]], y=[p["local_moves"]],
+            mode="markers+text",
+            marker=dict(
+                size=18, color=COLORS["accent"],
+                line=dict(color="white", width=2),
+            ),
+            text=[p["label"]],
+            textposition="top center",
+            textfont=dict(size=10, color=COLORS["navy"]),
+            hovertemplate=(
+                f"<b>{p['label']}</b><br>"
+                f"Cost: MVR %{{x:,.0f}}<br>"
+                f"Local moves: %{{y}}<br>"
+                f"Status: {p['status']}<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        height=480,
+        xaxis=dict(title="Total plan cost (MVR)", gridcolor=COLORS["border"]),
+        yaxis=dict(title="Local pilot moves", gridcolor=COLORS["border"]),
+        margin=dict(l=60, r=30, t=30, b=60),
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Let user select a Pareto point to load as result
+    st.markdown("**Load any Pareto point as your current result:**")
+    cols = st.columns(len(points))
+    for i, (col, p) in enumerate(zip(cols, points)):
+        with col:
+            if st.button(p["label"], key=f"pareto_load_{i}", width="stretch"):
+                # Reconstruct an OptimiserResult from this point
+                st.session_state.opt_result = OptimiserResult(
+                    status="feasible",
+                    objective_value=p["objective"],
+                    gap_percent=None,
+                    elapsed_seconds=0,
+                    actions=p["actions"],
+                    per_month_shortfall={},
+                    explanation=f"Loaded Pareto point '{p['label']}'.",
+                )
+                st.rerun()
+
 
 
 # ---------------------------------------------------------------------------
@@ -4051,7 +4695,8 @@ def main():
         "🌐 Flow Map",
         "🌏 Localisation",
         "🛂 Expat Watch",
-        "🤖 AI Optimiser",
+        "⚙ Optimiser",
+        "🤖 AI Prompt",
         "🖨 Print Plan",
     ])
 
@@ -4064,6 +4709,7 @@ def main():
         tab_flow_map,
         tab_localisation,
         tab_expat_watch,
+        tab_optimiser,
         tab_ai_optimiser,
         tab_print_plan,
     ]
