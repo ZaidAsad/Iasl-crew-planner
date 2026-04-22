@@ -3489,6 +3489,553 @@ def _flow_network(d, up_to_month: int):
 
 
 # ---------------------------------------------------------------------------
+# TAB — Expat Watch
+# ---------------------------------------------------------------------------
+def tab_expat_watch():
+    """
+    A senior-management focused view of expatriate pilot lifecycle —
+    arrivals, departures, current composition, per-fleet headcount vs target,
+    and detailed pilot facts.
+    """
+    ss = st.session_state
+    d = derived()
+
+    section_header("Expat Watch")
+    info_panel(
+        "A dedicated view of expatriate pilots: who is in the roster now, "
+        "who is planned to depart, who is being inducted, and how their "
+        "movements affect each fleet's ability to meet crew-set "
+        "requirements. Designed for senior management reporting. All "
+        "figures respect scheduled Pilot Terminations and Expat Hires.",
+        kind="info",
+    )
+
+    # -----------------------------------------------------------------------
+    # Compute expat lifecycle events
+    # -----------------------------------------------------------------------
+    expats_current = [p for p in ss.pilots if p.nationality == "Expat"]
+
+    # Termination lookup
+    terminated_at: dict[str, int] = {}
+    for a in ss.actions:
+        if a.action_type == "Pilot Termination":
+            for tid in a.trainee_ids:
+                if tid.startswith("TBD"):
+                    continue
+                if tid not in terminated_at or a.start_month < terminated_at[tid]:
+                    terminated_at[tid] = a.start_month
+
+    # Hire lookup (expats scheduled to arrive)
+    expat_arrivals: list[dict] = []
+    for a in ss.actions:
+        if a.action_type == "Expat Hire":
+            arrival_month = a.start_month + a.duration
+            if 0 <= arrival_month <= ss.horizon:
+                expat_arrivals.append({
+                    "action_id": a.id,
+                    "name": a.new_pilot_name or "TBD",
+                    "fleet": a.to_fleet,
+                    "function": a.to_function,
+                    "start_month": a.start_month,
+                    "arrival_month": arrival_month,
+                    "duration": a.duration,
+                    "cost": getattr(a, "cost", 0.0) or 0.0,
+                    "cost_currency": getattr(a, "cost_currency", "USD") or "USD",
+                    "note": a.note,
+                })
+
+    # Build lifeline entries: existing expats + scheduled arrivals
+    lifelines: list[dict] = []
+
+    # Existing expats: service from month 0 until termination (if any) or horizon
+    for p in expats_current:
+        if p.fleet not in FLEETS:
+            continue
+        end_month = terminated_at.get(p.employee_id, ss.horizon)
+        lifelines.append({
+            "kind": "existing",
+            "id": p.employee_id,
+            "name": p.full_name,
+            "fleet": p.fleet,
+            "function": p.function,
+            "designations": p.designations,
+            "management": p.management,
+            "status": p.status,
+            "start_month": 0,
+            "end_month": end_month,
+            "terminated": p.employee_id in terminated_at,
+            "termination_month": terminated_at.get(p.employee_id),
+        })
+
+    # Scheduled arrivals: service from arrival_month until horizon
+    for arr in expat_arrivals:
+        lifelines.append({
+            "kind": "arrival",
+            "id": f"_new_{arr['action_id']}",
+            "name": arr["name"],
+            "fleet": arr["fleet"],
+            "function": arr["function"],
+            "designations": [],
+            "management": False,
+            "status": "Planned",
+            "start_month": arr["arrival_month"],
+            "end_month": ss.horizon,
+            "terminated": False,
+            "termination_month": None,
+            "recruitment_month": arr["start_month"],
+            "cost": arr["cost"],
+            "cost_currency": arr["cost_currency"],
+        })
+
+    # -----------------------------------------------------------------------
+    # Headline metrics
+    # -----------------------------------------------------------------------
+    arrivals_count = len(expat_arrivals)
+    departures_count = sum(
+        1 for p in expats_current if p.employee_id in terminated_at
+    )
+    starting_expats = len(expats_current)
+    ending_expats = sum(
+        1 for p in expats_current
+        if p.employee_id not in terminated_at
+    ) + arrivals_count
+    net_change = ending_expats - starting_expats
+
+    # Monthly expat count trajectory
+    monthly_expat_counts = []
+    for m in range(ss.horizon):
+        count = 0
+        for lf in lifelines:
+            if lf["start_month"] <= m < lf["end_month"]:
+                count += 1
+        monthly_expat_counts.append(count)
+
+    peak = max(monthly_expat_counts) if monthly_expat_counts else 0
+    trough = min(monthly_expat_counts) if monthly_expat_counts else 0
+
+    mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+    with mc1:
+        metric_card("Current expats", starting_expats,
+                    "at horizon start")
+    with mc2:
+        metric_card("Horizon-end expats", ending_expats,
+                    f"{'↑' if net_change > 0 else ('↓' if net_change < 0 else '→')} "
+                    f"{net_change:+d} net")
+    with mc3:
+        metric_card("Arrivals", arrivals_count, "planned in horizon")
+    with mc4:
+        metric_card("Departures", departures_count, "planned in horizon")
+    with mc5:
+        metric_card("Peak count", peak, "max concurrent expats")
+    with mc6:
+        metric_card("Trough count", trough, "min concurrent expats")
+
+    # -----------------------------------------------------------------------
+    # Filters
+    # -----------------------------------------------------------------------
+    section_header("Filters")
+    f1, f2, f3, f4 = st.columns([2, 2, 2, 3])
+    with f1:
+        flt_fleet = st.multiselect("Fleets", FLEETS, default=FLEETS, key="ew_fleet")
+    with f2:
+        flt_func = st.multiselect("Functions", FUNCTIONS, default=FUNCTIONS, key="ew_func")
+    with f3:
+        flt_kind = st.multiselect(
+            "Show", ["Existing (continuing)", "Existing (departing)", "Planned arrival"],
+            default=["Existing (continuing)", "Existing (departing)", "Planned arrival"],
+            key="ew_kind",
+        )
+    with f4:
+        sort_by = st.selectbox(
+            "Sort lifelines by",
+            ["Fleet → Function → Name",
+             "Termination month (soonest first)",
+             "Arrival month (soonest first)",
+             "Designation (TRE/TRI/LI first)"],
+            key="ew_sort",
+        )
+
+    def _kind_label(lf):
+        if lf["kind"] == "arrival":
+            return "Planned arrival"
+        if lf["terminated"]:
+            return "Existing (departing)"
+        return "Existing (continuing)"
+
+    # Apply filters
+    filtered = [
+        lf for lf in lifelines
+        if lf["fleet"] in flt_fleet
+        and lf["function"] in flt_func
+        and _kind_label(lf) in flt_kind
+    ]
+
+    # Apply sort
+    if sort_by == "Fleet → Function → Name":
+        filtered.sort(key=lambda lf: (
+            FLEETS.index(lf["fleet"]) if lf["fleet"] in FLEETS else 99,
+            FUNCTIONS.index(lf["function"]) if lf["function"] in FUNCTIONS else 99,
+            lf["name"],
+        ))
+    elif sort_by == "Termination month (soonest first)":
+        filtered.sort(key=lambda lf: (
+            lf["termination_month"] if lf["termination_month"] is not None else 9999,
+            lf["name"],
+        ))
+    elif sort_by == "Arrival month (soonest first)":
+        filtered.sort(key=lambda lf: (
+            lf["start_month"] if lf["kind"] == "arrival" else -1,
+            lf["name"],
+        ))
+    elif sort_by == "Designation (TRE/TRI/LI first)":
+        filtered.sort(key=lambda lf: (
+            0 if any(d in ("TRE", "TRI", "LI") for d in lf.get("designations", [])) else 1,
+            lf["fleet"],
+            lf["name"],
+        ))
+
+    if not filtered:
+        info_panel("No expat pilots match the current filters.", kind="warn")
+        return
+
+    # -----------------------------------------------------------------------
+    # Lifeline Gantt chart
+    # -----------------------------------------------------------------------
+    section_header(f"Expat pilot lifelines ({len(filtered)} shown)")
+
+    _render_expat_lifeline(filtered, d, terminated_at, expat_arrivals)
+
+    # -----------------------------------------------------------------------
+    # Cumulative expat count curve with per-fleet breakdown
+    # -----------------------------------------------------------------------
+    section_header("Expat headcount trajectory")
+
+    _render_expat_headcount_trajectory(lifelines, d, flt_fleet, flt_func)
+
+    # -----------------------------------------------------------------------
+    # Per-fleet impact table
+    # -----------------------------------------------------------------------
+    section_header("Per-fleet expat impact")
+
+    _render_expat_fleet_impact(lifelines, d, ss, flt_fleet)
+
+    # -----------------------------------------------------------------------
+    # Detail table
+    # -----------------------------------------------------------------------
+    section_header("Expat pilot details")
+    _render_expat_detail_table(filtered, d)
+
+
+def _render_expat_lifeline(lifelines, d, terminated_at, expat_arrivals):
+    """
+    Gantt-style chart: one row per expat pilot, coloured bar showing service
+    window, with markers for entry/exit events.
+    """
+    labels = d["labels"]
+    horizon = len(labels)
+
+    fig = go.Figure()
+
+    y_labels = []
+    for lf_i, lf in enumerate(lifelines):
+        y_labels.append(
+            f"<b>{lf['name']}</b><br>"
+            f"<span style='font-size:10px; color:{COLORS['text_muted']}'>"
+            f"{lf['fleet']} · {lf['function']}"
+            f"{' · MGMT' if lf.get('management') else ''}"
+            f"</span>"
+        )
+
+        start = lf["start_month"]
+        end = lf["end_month"]
+        if end > horizon:
+            end = horizon
+        if start >= horizon:
+            continue
+
+        bar_color = _fleet_function_color(lf["fleet"], lf["function"], 0.85)
+
+        # Service bar
+        fig.add_trace(go.Scatter(
+            x=[labels[start], labels[min(end, horizon - 1)]],
+            y=[lf_i, lf_i],
+            mode="lines",
+            line=dict(color=bar_color, width=14),
+            opacity=0.88,
+            hovertemplate=(
+                f"<b>{lf['name']}</b><br>"
+                f"{lf['fleet']} {lf['function']}<br>"
+                f"Status: {_describe_status(lf)}<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+
+        # Departure marker if terminated
+        if lf.get("terminated") and lf.get("termination_month") is not None:
+            term_m = lf["termination_month"]
+            if 0 <= term_m < horizon:
+                fig.add_trace(go.Scatter(
+                    x=[labels[term_m]],
+                    y=[lf_i],
+                    mode="markers",
+                    marker=dict(
+                        symbol="x",
+                        size=14,
+                        color=COLORS["red"],
+                        line=dict(width=2.5, color="white"),
+                    ),
+                    hovertemplate=(
+                        f"<b>DEPARTURE</b><br>"
+                        f"{lf['name']} ({lf['fleet']} {lf['function']})<br>"
+                        f"Terminates: {labels[term_m]}<extra></extra>"
+                    ),
+                    showlegend=False,
+                ))
+
+        # Arrival marker if planned arrival
+        if lf["kind"] == "arrival":
+            arr_m = lf["start_month"]
+            if 0 <= arr_m < horizon:
+                fig.add_trace(go.Scatter(
+                    x=[labels[arr_m]],
+                    y=[lf_i],
+                    mode="markers",
+                    marker=dict(
+                        symbol="triangle-right",
+                        size=16,
+                        color=COLORS["green"],
+                        line=dict(width=2, color="white"),
+                    ),
+                    hovertemplate=(
+                        f"<b>ARRIVAL</b><br>"
+                        f"{lf['name']} ({lf['fleet']} {lf['function']})<br>"
+                        f"Active from: {labels[arr_m]}<extra></extra>"
+                    ),
+                    showlegend=False,
+                ))
+            # Recruitment start marker
+            rec_m = lf.get("recruitment_month")
+            if rec_m is not None and 0 <= rec_m < horizon and rec_m < arr_m:
+                fig.add_trace(go.Scatter(
+                    x=[labels[rec_m], labels[arr_m]],
+                    y=[lf_i, lf_i],
+                    mode="lines",
+                    line=dict(color=COLORS["green"], width=2, dash="dot"),
+                    opacity=0.5,
+                    hovertemplate=(
+                        f"Recruitment window<br>"
+                        f"{lf['name']}<br>"
+                        f"Start: {labels[rec_m]}<extra></extra>"
+                    ),
+                    showlegend=False,
+                ))
+
+    # Legend proxies
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="lines",
+        line=dict(color=COLORS["text_muted"], width=12),
+        name="Service window",
+    ))
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(symbol="x", size=14, color=COLORS["red"]),
+        name="Planned departure",
+    ))
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(symbol="triangle-right", size=14, color=COLORS["green"]),
+        name="Planned arrival",
+    ))
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="lines",
+        line=dict(color=COLORS["green"], dash="dot", width=2),
+        name="Recruitment window",
+    ))
+
+    row_height = 32
+    fig.update_layout(
+        height=max(300, len(lifelines) * row_height + 120),
+        yaxis=dict(
+            tickmode="array",
+            tickvals=list(range(len(lifelines))),
+            ticktext=y_labels,
+            autorange="reversed",
+            gridcolor=COLORS["border"],
+            showgrid=False,
+        ),
+        xaxis=dict(
+            title="",
+            gridcolor=COLORS["border"],
+            tickangle=-45,
+        ),
+        margin=dict(l=200, r=30, t=20, b=100),
+        hovermode="closest",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=-0.15,
+            xanchor="center", x=0.5,
+        ),
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _describe_status(lf) -> str:
+    if lf["kind"] == "arrival":
+        return "Planned arrival"
+    if lf.get("terminated"):
+        return "Departing"
+    return "Continuing"
+
+
+def _render_expat_headcount_trajectory(lifelines, d, flt_fleet, flt_func):
+    """
+    Stacked area per fleet of expat headcount across the horizon,
+    with total expat line overlaid.
+    """
+    labels = d["labels"]
+    horizon = len(labels)
+
+    # Compute per-fleet × function × month count
+    per_fleet_monthly: dict[str, list[int]] = {f: [0] * horizon for f in FLEETS}
+    for lf in lifelines:
+        if lf["fleet"] not in flt_fleet: continue
+        if lf["function"] not in flt_func: continue
+        for m in range(horizon):
+            if lf["start_month"] <= m < lf["end_month"]:
+                per_fleet_monthly[lf["fleet"]][m] += 1
+
+    fig = go.Figure()
+    for f in FLEETS:
+        if f not in flt_fleet: continue
+        fig.add_trace(go.Scatter(
+            x=labels, y=per_fleet_monthly[f],
+            name=f,
+            mode="lines",
+            stackgroup="expats",
+            line=dict(width=1, color=FLEET_COLORS[f]),
+            fillcolor=_fleet_function_color(f, "Captain", 0.6),
+            hovertemplate=f"<b>{f}</b><br>%{{x}}<br>Expats: %{{y}}<extra></extra>",
+        ))
+
+    # Total line
+    totals = [sum(per_fleet_monthly[f][m] for f in FLEETS if f in flt_fleet)
+              for m in range(horizon)]
+    fig.add_trace(go.Scatter(
+        x=labels, y=totals, name="Total expats",
+        mode="lines+markers",
+        line=dict(color=COLORS["navy"], width=2.5, dash="dash"),
+        marker=dict(size=5, color=COLORS["navy"]),
+        hovertemplate="<b>Total expats</b><br>%{x}<br>%{y}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        height=360,
+        xaxis=dict(tickangle=-45, gridcolor=COLORS["border"]),
+        yaxis=dict(title="Expat pilots", gridcolor=COLORS["border"], rangemode="tozero"),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35,
+                    xanchor="center", x=0.5, font=dict(size=11)),
+        margin=dict(l=60, r=30, t=20, b=100),
+        hovermode="x unified",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_expat_fleet_impact(lifelines, d, ss, flt_fleet):
+    """
+    Per-fleet table: current expat count, planned departures, planned arrivals,
+    net change, current requirement, risk indicator.
+    """
+    rows = []
+    for f in FLEETS:
+        if f not in flt_fleet: continue
+        for fn in FUNCTIONS:
+            fleet_pool = [lf for lf in lifelines
+                          if lf["fleet"] == f and lf["function"] == fn]
+
+            current = sum(
+                1 for lf in fleet_pool
+                if lf["kind"] == "existing" and not lf.get("terminated")
+            )
+            current_at_start = sum(
+                1 for lf in fleet_pool
+                if lf["kind"] == "existing"
+            )
+            departures = sum(
+                1 for lf in fleet_pool
+                if lf["kind"] == "existing" and lf.get("terminated")
+            )
+            arrivals = sum(1 for lf in fleet_pool if lf["kind"] == "arrival")
+            ending = current + arrivals
+            req_end = d["req"][f][fn][-1]
+            avail_end = d["avail"][f][fn][-1]
+            gap_end = max(0, req_end - avail_end)
+            band = gap_band(gap_end)
+
+            rows.append({
+                "Fleet": f,
+                "Function": fn,
+                "Expats now": current_at_start,
+                "Planned departures": departures,
+                "Planned arrivals": arrivals,
+                "Expats at horizon end": ending,
+                "Net change": f"{ending - current_at_start:+d}",
+                "Total crew req (end)": req_end,
+                "Total avail (end)": f"{avail_end:.1f}",
+                "Gap band (end)": band.upper(),
+            })
+
+    if not rows:
+        info_panel("No fleets match the filter.")
+        return
+
+    df = pd.DataFrame(rows)
+    st.dataframe(_safe_df(df), hide_index=True, width="stretch")
+
+
+def _render_expat_detail_table(filtered, d):
+    """Detail rows for each expat pilot in the filtered view."""
+    labels = d["labels"]
+    rows = []
+    for lf in filtered:
+        if lf["kind"] == "arrival":
+            entry_label = labels[lf["start_month"]] if 0 <= lf["start_month"] < len(labels) else "—"
+            exit_label = "—"
+            status = "Planned arrival"
+            cost_val = lf.get("cost", 0) or 0
+            cost_cur = lf.get("cost_currency", "USD") or "USD"
+            cost_str = f"{cost_cur} {cost_val:,.0f}" if cost_val > 0 else "—"
+        else:
+            entry_label = "Pre-horizon"
+            if lf.get("terminated") and lf.get("termination_month") is not None:
+                exit_label = labels[lf["termination_month"]] if 0 <= lf["termination_month"] < len(labels) else "—"
+                status = "Departing"
+            else:
+                exit_label = "—"
+                status = "Continuing"
+            cost_str = "—"
+
+        rows.append({
+            "ID": lf["id"],
+            "Name": lf["name"],
+            "Fleet": lf["fleet"],
+            "Function": lf["function"],
+            "Mgmt": "Yes" if lf.get("management") else "No",
+            "Designations": ", ".join(lf.get("designations") or []) or "—",
+            "Status": status,
+            "Enters": entry_label,
+            "Exits": exit_label,
+            "Recruitment cost": cost_str,
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(_safe_df(df), hide_index=True, height=min(500, 40 * len(rows) + 60),
+                 width="stretch")
+
+
+
+# ---------------------------------------------------------------------------
 # Main — with per-tab crash isolation
 # ---------------------------------------------------------------------------
 def main():
@@ -3503,6 +4050,7 @@ def main():
         "🎯 Action Planner",
         "🌐 Flow Map",
         "🌏 Localisation",
+        "🛂 Expat Watch",
         "🤖 AI Optimiser",
         "🖨 Print Plan",
     ])
@@ -3515,6 +4063,7 @@ def main():
         tab_action_planner,
         tab_flow_map,
         tab_localisation,
+        tab_expat_watch,
         tab_ai_optimiser,
         tab_print_plan,
     ]
