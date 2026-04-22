@@ -188,7 +188,9 @@ h3 { font-size: 1.1rem; }
     box-shadow: 0 2px 10px rgba(15,41,68,0.06);
 }
 .iasl-brand {
-    display: flex; align-items: center; gap: 14px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
 }
 .iasl-logo {
     width: 42px; height: 42px; border-radius: 10px;
@@ -199,21 +201,28 @@ h3 { font-size: 1.1rem; }
     box-shadow: 0 4px 12px rgba(0,133,122,0.25);
 }
 .iasl-logo-img {
-    width: 48px;
-    height: 48px;
+    width: 72px;
+    height: 72px;
     object-fit: contain;
-    border-radius: 8px;
+    border-radius: 12px;
     background: white;
-    padding: 4px;
-    box-shadow: 0 2px 8px rgba(15, 41, 68, 0.08);
+    padding: 6px;
+    box-shadow: 0 4px 14px rgba(15, 41, 68, 0.15);
+    border: 1px solid rgba(0, 133, 122, 0.2);
 }
 .iasl-title {
-    font-size: 17px; font-weight: 700; color: __NAVY__;
-    line-height: 1.1;
+    font-size: 22px;
+    font-weight: 700;
+    color: __NAVY__;
+    line-height: 1.15;
+    letter-spacing: -0.01em;
 }
 .iasl-subtitle {
-    font-size: 11px; color: __MUTED__;
-    text-transform: uppercase; letter-spacing: 1.2px;
+    font-size: 12px;
+    color: __MUTED__;
+    text-transform: uppercase;
+    letter-spacing: 1.4px;
+    margin-top: 3px;
 }
 .iasl-nav-stats {
     display: flex; gap: 28px;
