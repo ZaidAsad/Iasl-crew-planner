@@ -4184,66 +4184,109 @@ def tab_optimiser():
         unsafe_allow_html=True,
     )
 
+    # Solver horizon — independent of main app horizon
+    sh_c1, sh_c2 = st.columns([2, 5])
+    with sh_c1:
+        solver_horizon_months = st.number_input(
+            "Solver planning horizon (months from now)",
+            min_value=6, max_value=120, value=max(ss.horizon, 24), step=3,
+            key="opt_solver_horizon",
+            help=(
+                "How many months forward the solver should think about. "
+                "Independent of the main planning horizon (currently "
+                f"{ss.horizon} months). Set larger than the main horizon "
+                "to reason about longer-range localisation strategies."
+            ),
+        )
+    with sh_c2:
+        if solver_horizon_months > ss.horizon:
+            st.info(
+                f"📐 Solver will extend its reasoning to **{solver_horizon_months} months**, "
+                f"beyond your main {ss.horizon}-month planning horizon. "
+                "Aircraft counts and requirements are held constant past the main horizon."
+            )
+        else:
+            st.caption(
+                f"Solver horizon matches or is shorter than the main planning horizon ({ss.horizon} months)."
+            )
+
     win_c1, win_c2, win_c3 = st.columns([2, 2, 3])
 
-    # Default window: whole horizon, or from "now" (month 0) to end
     default_start = 0
-    default_end = max(0, ss.horizon - 1)
+    default_end = max(0, solver_horizon_months - 1)
 
     with win_c1:
-        window_start_month = st.selectbox(
-            "Window START month",
-            options=list(range(ss.horizon)),
-            format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}",
-            index=default_start,
+        window_start_month = st.number_input(
+            "Window START (month index, 0-based)",
+            min_value=0, max_value=solver_horizon_months - 1,
+            value=default_start, step=1,
             key="opt_window_start",
             help=(
-                "The first month in which the solver may propose new actions. "
-                "Anything before this month is treated as already committed."
+                "The first month the solver may propose new actions in. "
+                "Month 0 is the current month. Existing actions before this "
+                "point are treated as committed."
             ),
         )
     with win_c2:
-        # Filter end options to those >= start
-        end_options = list(range(window_start_month, ss.horizon))
-        window_end_month = st.selectbox(
-            "Window END month",
-            options=end_options,
-            format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}",
-            index=len(end_options) - 1,
+        window_end_month = st.number_input(
+            "Window END (month index, 0-based)",
+            min_value=window_start_month,
+            max_value=solver_horizon_months - 1,
+            value=min(default_end, solver_horizon_months - 1), step=1,
             key="opt_window_end",
             help=(
-                "The last month in which the solver may propose new actions. "
-                "Training actions must complete by this month to count."
+                "The last month the solver may propose new actions in. "
+                "Training actions must complete by this month."
             ),
         )
     with win_c3:
         window_len = window_end_month - window_start_month + 1
+
+        def _month_label(i):
+            if i < len(d["labels"]):
+                return d["labels"][i]
+            # Project forward past the main horizon
+            months_past = i - (len(d["labels"]) - 1)
+            # Rough extension — walk the calendar
+            last = d["labels"][-1]
+            try:
+                import calendar
+                # last is like "2026-Aug"; parse year and month
+                y_str, m_abbr = last.split("-")
+                y = int(y_str)
+                m_idx = list(calendar.month_abbr).index(m_abbr)
+                total_m = m_idx + months_past
+                y += (total_m - 1) // 12
+                m_final = ((total_m - 1) % 12) + 1
+                return f"{y}-{calendar.month_abbr[m_final]}"
+            except Exception:
+                return f"+M{i}"
+
         st.markdown(
             f"""
             <div style="background:{COLORS['surface']}; border:1px solid {COLORS['border']};
                  border-radius:10px; padding:12px 16px; margin-top:24px; font-size:12px;">
                 <b>Window length:</b> {window_len} months<br>
-                <b>From:</b> {d['labels'][window_start_month]}<br>
-                <b>To:</b> {d['labels'][window_end_month]}<br>
+                <b>From:</b> {_month_label(window_start_month)}<br>
+                <b>To:</b> {_month_label(window_end_month)}<br>
                 <span style="color:{COLORS['text_muted']}">
-                Existing actions count towards baseline. New actions only allowed in this window.
+                Existing actions count toward baseline. New actions only allowed in this window.
                 </span>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-    # Live preview of starting state
     with st.expander("📸 Preview — crew state at window start", expanded=False):
         st.caption(
             "This shows what the solver will see as the starting point at the "
-            "beginning of the window, after all your existing actions are applied. "
-            "If something looks off here, fix it in the Action Planner before running."
+            "beginning of the window, after all your existing actions are applied."
         )
         try:
             preview = preview_window_state(
                 current_state_payload(),
                 window_start_month=window_start_month,
+                solver_horizon=solver_horizon_months,
             )
             preview_rows = []
             for f in FLEETS:
@@ -4263,7 +4306,6 @@ def tab_optimiser():
                     })
             st.dataframe(_safe_df(preview_rows), hide_index=True, width="stretch")
 
-            # Count existing actions inside vs outside the window
             in_window_actions = [
                 a for a in ss.actions
                 if window_start_month <= a.start_month <= window_end_month
@@ -4473,9 +4515,10 @@ def tab_optimiser():
             allow_expat_hires=allow_expat_hires,
             expat_contract_months=expat_contract_months,
             strategy_key=strategy_key,
-            window_start_month=window_start_month,
-            window_end_month=window_end_month,
+            window_start_month=int(window_start_month),
+            window_end_month=int(window_end_month),
             enforce_monthly=enforce_monthly,
+            solver_horizon_months=int(solver_horizon_months),
             run_pareto=run_pareto,
         )
 
@@ -4493,7 +4536,7 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
                                  allow_term, allow_expat_hires,
                                  expat_contract_months, strategy_key,
                                  window_start_month, window_end_month,
-                                 enforce_monthly,
+                                 enforce_monthly, solver_horizon_months,
                                  run_pareto):
     """Execute solver with progress UI. Updates session state with result."""
     ss = st.session_state
@@ -4540,6 +4583,7 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
         ss.opt_pareto_points = _run_pareto(
             state, goals, weights, max_conc, allow_term, allow_expat_hires,
             window_start_month, window_end_month, enforce_monthly,
+            solver_horizon_months,
             progress_cb,
         )
         phase_placeholder.markdown("**Phase:** Pareto done")
@@ -4557,6 +4601,7 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
             window_start_month=window_start_month,
             window_end_month=window_end_month,
             enforce_monthly_requirements=enforce_monthly,
+            solver_horizon_override_months=solver_horizon_months,
         )
         fast_result = optimiser_solve(
             state, goals, weights, config_fast, progress_cb, should_stop,
@@ -4580,6 +4625,7 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
             window_start_month=window_start_month,
             window_end_month=window_end_month,
             enforce_monthly_requirements=enforce_monthly,
+            solver_horizon_override_months=solver_horizon_months,
         )
         deep_result = optimiser_solve(
             state, goals, weights, config_deep, progress_cb, should_stop,
@@ -4598,6 +4644,7 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
 
 def _run_pareto(state, goals, base_weights, max_conc, allow_term, allow_expat_hires,
                 window_start_month, window_end_month, enforce_monthly,
+                solver_horizon_months,
                 progress_cb) -> list[dict]:
     """
     Compute a cost-vs-localisation Pareto frontier by solving at several
@@ -4629,6 +4676,7 @@ def _run_pareto(state, goals, base_weights, max_conc, allow_term, allow_expat_hi
             window_start_month=window_start_month,
             window_end_month=window_end_month,
             enforce_monthly_requirements=enforce_monthly,
+            solver_horizon_override_months=solver_horizon_months,
         )
         r = optimiser_solve(state, goals, w, cfg, progress_cb, lambda: False)
         if r.objective_value is not None:
