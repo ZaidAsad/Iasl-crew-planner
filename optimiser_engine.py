@@ -165,6 +165,7 @@ class OptimiserWeights:
     # the expat contract horizon constraint below, this makes the solver only
     # hire expats when genuinely unavoidable for meeting a hard goal.
 
+
 @dataclass
 class OptimiserConfig:
     mode: str = "fast"
