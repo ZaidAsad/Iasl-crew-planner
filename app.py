@@ -4168,44 +4168,95 @@ def tab_optimiser():
     else:
         info_panel("No goals defined yet. Add at least one above.", kind="warn")
         return
-
+# -----------------------------------------------------------------
+    # Step 2: Strategy + weight presets
     # -----------------------------------------------------------------
-    # Step 2: Weights
-    # -----------------------------------------------------------------
-    section_header("Step 2 — Tune objective weights")
+    section_header("Step 2 — Strategy")
     st.markdown(
-        "These weights determine the trade-off the optimiser makes. Higher "
-        "shortfall weight forces it to meet crew requirements every month. "
-        "Higher expat weight accelerates localisation. Negative local-added "
-        "weight rewards the solver for promoting / hiring locals."
+        "Pick the strategic intent for this solve. The optimiser will use "
+        "preset weights that reflect the company's standing policy: "
+        "<b>locals preferred, expats used only as a time-bound bridge</b>. "
+        "Advanced users can override the defaults below.",
+        unsafe_allow_html=True,
     )
 
-    wc1, wc2, wc3 = st.columns(3)
-    with wc1:
-        w_cost = st.slider(
-            "Cost weight", 0.0, 5.0, 1.0, 0.1, key="opt_w_cost",
-            help="Weight on total MVR cost of training + hiring + termination.",
+    strategy = st.radio(
+        "Strategic intent",
+        [
+            "💰 Minimise training cost (prefer cheapest path to targets)",
+            "⏱ Minimise time to targets (hit goals as early as possible)",
+            "⚖ Balanced (moderate cost, moderate speed)",
+        ],
+        key="opt_strategy",
+    )
+
+    if strategy.startswith("💰"):
+        strategy_key = "cost"
+        preset = dict(
+            w_cost=3.0,
+            w_expat=3_000,
+            w_short_millions=20,
+            w_local=-150_000,
+            w_time=5_000,
+            w_expat_hire_millions=8,
         )
-        w_expat = st.slider(
-            "Expat-months weight", 0, 20000, 5000, 500, key="opt_w_expat",
-            help="Penalty per month an expatriate remains on the roster.",
+    elif strategy.startswith("⏱"):
+        strategy_key = "time"
+        preset = dict(
+            w_cost=0.5,
+            w_expat=15_000,
+            w_short_millions=80,
+            w_local=-400_000,
+            w_time=300_000,
+            w_expat_hire_millions=5,
         )
-    with wc2:
-        w_short_millions = st.slider(
-            "Shortfall weight (×1M)", 1, 100, 10, 1, key="opt_w_short",
-            help="Very large penalty per pilot-month of unmet requirement. "
-                 "Keep high unless shortfall is tolerable.",
+    else:
+        strategy_key = "balanced"
+        preset = dict(
+            w_cost=1.5,
+            w_expat=7_000,
+            w_short_millions=40,
+            w_local=-250_000,
+            w_time=80_000,
+            w_expat_hire_millions=7,
         )
-        w_local = st.slider(
-            "Local-added bonus (negative)", -2_000_000, 0, -500_000, 50_000,
-            key="opt_w_local",
-            help="Negative = bonus awarded per new local added to roster.",
+
+    with st.expander("⚙ Advanced: tune individual weights"):
+        st.caption(
+            "These presets usually give good results. Only adjust if you know "
+            "what each weight does. Higher shortfall weight makes the solver "
+            "try harder to meet monthly crew requirements. Higher expat-hire "
+            "penalty pushes it to avoid bridge expat hires. Negative local "
+            "bonus rewards promoting / hiring locals."
         )
-    with wc3:
-        w_time = st.slider(
-            "Time-to-target weight", 0, 500_000, 50_000, 10_000, key="opt_w_time",
-            help="Soft penalty on achieving targets late.",
-        )
+        wc1, wc2, wc3 = st.columns(3)
+        with wc1:
+            w_cost = st.slider(
+                "Cost weight", 0.0, 5.0, preset["w_cost"], 0.1, key="opt_w_cost",
+            )
+            w_expat = st.slider(
+                "Expat-months weight", 0, 30_000, preset["w_expat"], 500,
+                key="opt_w_expat",
+            )
+        with wc2:
+            w_short_millions = st.slider(
+                "Shortfall weight (×1M)", 1, 200, preset["w_short_millions"], 1,
+                key="opt_w_short",
+            )
+            w_local = st.slider(
+                "Local-added bonus (negative = reward)",
+                -1_000_000, 0, preset["w_local"], 25_000, key="opt_w_local",
+            )
+        with wc3:
+            w_time = st.slider(
+                "Time-to-target weight", 0, 500_000, preset["w_time"], 10_000,
+                key="opt_w_time",
+            )
+            w_expat_hire_millions = st.slider(
+                "Expat-hire penalty (×1M)", 0, 30,
+                preset["w_expat_hire_millions"], 1, key="opt_w_expat_hire",
+                help="Large per-hire penalty discouraging bridge expat hires.",
+            )
 
     weights = OptimiserWeights(
         cost=w_cost,
@@ -4213,9 +4264,9 @@ def tab_optimiser():
         shortfall=float(w_short_millions) * 1_000_000,
         local_added=float(w_local),
         time_to_target=float(w_time),
+        expat_hire_penalty=float(w_expat_hire_millions) * 1_000_000,
     )
-
-    # -----------------------------------------------------------------
+# -----------------------------------------------------------------
     # Step 3: Solver config
     # -----------------------------------------------------------------
     section_header("Step 3 — Solver configuration")
@@ -4229,15 +4280,35 @@ def tab_optimiser():
             help="Fast gives a workable plan quickly. Deep runs longer for a "
                  "higher-quality solution. Fast→Deep does both in sequence.",
         )
-    with cc2:
         max_conc = st.slider(
             "Max concurrent trainings per fleet", 1, 6, 2, key="opt_max_conc",
         )
-        allow_term = st.checkbox("Allow expat terminations", value=True, key="opt_allow_term")
-    with cc3:
+    with cc2:
+        allow_term = st.checkbox(
+            "Allow expat terminations (of existing expats)",
+            value=True, key="opt_allow_term",
+        )
         allow_expat_hires = st.checkbox(
-            "Allow expat hires", value=True, key="opt_allow_expat_hires",
-            help="If off, only locals can be hired (ATR FO cadets only).",
+            "Allow bridge expat hires (auto-terminated after contract)",
+            value=True, key="opt_allow_expat_hires",
+            help=(
+                "Expats hired by the solver are automatically scheduled for "
+                "termination after the contract horizon set below. This "
+                "enforces the rule that expats are a bridge, not a permanent "
+                "hire. Turn this off to forbid all expat hiring."
+            ),
+        )
+    with cc3:
+        expat_contract_months = st.slider(
+            "Expat contract horizon (months)",
+            min_value=6, max_value=48, value=24, step=3,
+            key="opt_expat_contract",
+            help=(
+                "Any expat hire proposed by the solver is automatically given "
+                "a termination action this many months after arrival. Shorter "
+                "= more pressure on the company pipeline to ready a local "
+                "replacement."
+            ),
         )
         run_pareto = st.checkbox(
             "Compute cost-vs-localisation Pareto",
@@ -4275,6 +4346,8 @@ def tab_optimiser():
             max_conc=max_conc,
             allow_term=allow_term,
             allow_expat_hires=allow_expat_hires,
+            expat_contract_months=expat_contract_months,
+            strategy_key=strategy_key,
             run_pareto=run_pareto,
         )
 
@@ -4289,7 +4362,9 @@ def tab_optimiser():
 
 
 def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
-                                 allow_term, allow_expat_hires, run_pareto):
+                                 allow_term, allow_expat_hires,
+                                 expat_contract_months, strategy_key,
+                                 run_pareto):
     """Execute solver with progress UI. Updates session state with result."""
     ss = st.session_state
     ss.opt_stop_requested = False
@@ -4346,6 +4421,8 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
             max_concurrent_trainings_per_fleet=max_conc,
             allow_expat_hires=allow_expat_hires,
             allow_terminations=allow_term,
+            expat_hire_contract_months=expat_contract_months,
+            strategy=strategy_key,
         )
         fast_result = optimiser_solve(
             state, goals, weights, config_fast, progress_cb, should_stop,
@@ -4364,6 +4441,8 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
             max_concurrent_trainings_per_fleet=max_conc,
             allow_expat_hires=allow_expat_hires,
             allow_terminations=allow_term,
+            expat_hire_contract_months=expat_contract_months,
+            strategy=strategy_key,
         )
         deep_result = optimiser_solve(
             state, goals, weights, config_deep, progress_cb, should_stop,
