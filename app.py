@@ -13,6 +13,7 @@ from optimiser_engine import (
     OptimiserGoal, OptimiserWeights, OptimiserConfig,
     SolverProgress, OptimiserResult,
     solve as optimiser_solve,
+    preview_window_state,
     EXPAT_MONTHLY_MVR, LOCAL_MONTHLY_MVR, MVR_PER_USD,
 )
 
@@ -4168,10 +4169,122 @@ def tab_optimiser():
     else:
         info_panel("No goals defined yet. Add at least one above.", kind="warn")
         return
-# -----------------------------------------------------------------
-    # Step 2: Strategy + weight presets
+
+
     # -----------------------------------------------------------------
-    section_header("Step 2 — Strategy")
+    # Step 2: Optimisation window
+    # -----------------------------------------------------------------
+    section_header("Step 2 — Optimisation window")
+    st.markdown(
+        "Choose the months the solver is allowed to plan within. Actions "
+        "outside this window — whether they are already in your plan or "
+        "would be further ahead — are left untouched. Existing actions in "
+        "your plan are <b>always respected</b> and the solver builds its "
+        "proposals on top of them, not instead of them.",
+        unsafe_allow_html=True,
+    )
+
+    win_c1, win_c2, win_c3 = st.columns([2, 2, 3])
+
+    # Default window: whole horizon, or from "now" (month 0) to end
+    default_start = 0
+    default_end = max(0, ss.horizon - 1)
+
+    with win_c1:
+        window_start_month = st.selectbox(
+            "Window START month",
+            options=list(range(ss.horizon)),
+            format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}",
+            index=default_start,
+            key="opt_window_start",
+            help=(
+                "The first month in which the solver may propose new actions. "
+                "Anything before this month is treated as already committed."
+            ),
+        )
+    with win_c2:
+        # Filter end options to those >= start
+        end_options = list(range(window_start_month, ss.horizon))
+        window_end_month = st.selectbox(
+            "Window END month",
+            options=end_options,
+            format_func=lambda i: f"{i+1:2d}. {d['labels'][i]}",
+            index=len(end_options) - 1,
+            key="opt_window_end",
+            help=(
+                "The last month in which the solver may propose new actions. "
+                "Training actions must complete by this month to count."
+            ),
+        )
+    with win_c3:
+        window_len = window_end_month - window_start_month + 1
+        st.markdown(
+            f"""
+            <div style="background:{COLORS['surface']}; border:1px solid {COLORS['border']};
+                 border-radius:10px; padding:12px 16px; margin-top:24px; font-size:12px;">
+                <b>Window length:</b> {window_len} months<br>
+                <b>From:</b> {d['labels'][window_start_month]}<br>
+                <b>To:</b> {d['labels'][window_end_month]}<br>
+                <span style="color:{COLORS['text_muted']}">
+                Existing actions count towards baseline. New actions only allowed in this window.
+                </span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # Live preview of starting state
+    with st.expander("📸 Preview — crew state at window start", expanded=False):
+        st.caption(
+            "This shows what the solver will see as the starting point at the "
+            "beginning of the window, after all your existing actions are applied. "
+            "If something looks off here, fix it in the Action Planner before running."
+        )
+        try:
+            preview = preview_window_state(
+                current_state_payload(),
+                window_start_month=window_start_month,
+            )
+            preview_rows = []
+            for f in FLEETS:
+                for fn in FUNCTIONS:
+                    s = preview[f][fn]
+                    band = gap_band(s["gap"])
+                    band_icon = {"green": "🟢", "amber": "🟡", "red": "🔴"}[band]
+                    preview_rows.append({
+                        "Fleet": f,
+                        "Function": fn,
+                        "Local": s["local"],
+                        "Expat": s["expat"],
+                        "Total available": f"{s['availability']:.1f}",
+                        "Required": s["requirement"],
+                        "Gap": f"{s['gap']:.1f}",
+                        "Band": f"{band_icon} {band.upper()}",
+                    })
+            st.dataframe(_safe_df(preview_rows), hide_index=True, width="stretch")
+
+            # Count existing actions inside vs outside the window
+            in_window_actions = [
+                a for a in ss.actions
+                if window_start_month <= a.start_month <= window_end_month
+            ]
+            outside_window_actions = [
+                a for a in ss.actions
+                if a.start_month < window_start_month or a.start_month > window_end_month
+            ]
+            st.caption(
+                f"**Existing actions:** {len(in_window_actions)} inside the window "
+                f"(locked in place, will affect baseline), "
+                f"{len(outside_window_actions)} outside the window "
+                f"(already applied to baseline or ignored for this solve)."
+            )
+        except Exception as e:
+            st.warning(f"Couldn't render preview: {e}")
+            
+# -----------------------------------------------------------------
+    # Step 3: Strategy + weight presets
+    # -----------------------------------------------------------------
+    section_header("Step 3 — Strategy")
     st.markdown(
         "Pick the strategic intent for this solve. The optimiser will use "
         "preset weights that reflect the company's standing policy: "
@@ -4267,9 +4380,9 @@ def tab_optimiser():
         expat_hire_penalty=float(w_expat_hire_millions) * 1_000_000,
     )
 # -----------------------------------------------------------------
-    # Step 3: Solver config
+    # Step 4: Solver config
     # -----------------------------------------------------------------
-    section_header("Step 3 — Solver configuration")
+    section_header("Step 4 — Solver configuration")
 
     cc1, cc2, cc3 = st.columns(3)
     with cc1:
@@ -4282,6 +4395,8 @@ def tab_optimiser():
         )
         max_conc = st.slider(
             "Max concurrent trainings per fleet", 1, 6, 2, key="opt_max_conc",
+            help="Counts existing training actions already in the window; the "
+                 "solver gets the remaining slots.",
         )
     with cc2:
         allow_term = st.checkbox(
@@ -4296,6 +4411,17 @@ def tab_optimiser():
                 "termination after the contract horizon set below. This "
                 "enforces the rule that expats are a bridge, not a permanent "
                 "hire. Turn this off to forbid all expat hiring."
+            ),
+        )
+        enforce_monthly = st.checkbox(
+            "Enforce monthly requirements inside window",
+            value=True, key="opt_enforce_monthly",
+            help=(
+                "When ON, the solver must meet crew requirements every month "
+                "in the window — useful for safety planning. When OFF, only "
+                "the goal target month must be met; intermediate shortfalls "
+                "are penalised softly but allowed. Turn OFF if you're seeing "
+                "infeasible results and want a looser plan."
             ),
         )
     with cc3:
@@ -4316,11 +4442,10 @@ def tab_optimiser():
             help="Runs the solver multiple times with different weight blends "
                  "to produce a Pareto frontier. Multiplies total solve time.",
         )
-
     # -----------------------------------------------------------------
-    # Step 4: Solve
+    # Step 5: Solve
     # -----------------------------------------------------------------
-    section_header("Step 4 — Run the optimiser")
+    section_header("Step 5 — Run the optimiser")
 
     sc1, sc2, sc3 = st.columns([2, 2, 4])
     with sc1:
@@ -4348,11 +4473,14 @@ def tab_optimiser():
             allow_expat_hires=allow_expat_hires,
             expat_contract_months=expat_contract_months,
             strategy_key=strategy_key,
+            window_start_month=window_start_month,
+            window_end_month=window_end_month,
+            enforce_monthly=enforce_monthly,
             run_pareto=run_pareto,
         )
 
     # -----------------------------------------------------------------
-    # Step 5: Results display
+    # Step 6: Results display
     # -----------------------------------------------------------------
     if ss.opt_result is not None:
         _render_optimiser_result(ss.opt_result, d)
@@ -4364,6 +4492,8 @@ def tab_optimiser():
 def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
                                  allow_term, allow_expat_hires,
                                  expat_contract_months, strategy_key,
+                                 window_start_month, window_end_month,
+                                 enforce_monthly,
                                  run_pareto):
     """Execute solver with progress UI. Updates session state with result."""
     ss = st.session_state
@@ -4409,6 +4539,7 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
     if run_pareto:
         ss.opt_pareto_points = _run_pareto(
             state, goals, weights, max_conc, allow_term, allow_expat_hires,
+            window_start_month, window_end_month, enforce_monthly,
             progress_cb,
         )
         phase_placeholder.markdown("**Phase:** Pareto done")
@@ -4423,6 +4554,9 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
             allow_terminations=allow_term,
             expat_hire_contract_months=expat_contract_months,
             strategy=strategy_key,
+            window_start_month=window_start_month,
+            window_end_month=window_end_month,
+            enforce_monthly_requirements=enforce_monthly,
         )
         fast_result = optimiser_solve(
             state, goals, weights, config_fast, progress_cb, should_stop,
@@ -4443,6 +4577,9 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
             allow_terminations=allow_term,
             expat_hire_contract_months=expat_contract_months,
             strategy=strategy_key,
+            window_start_month=window_start_month,
+            window_end_month=window_end_month,
+            enforce_monthly_requirements=enforce_monthly,
         )
         deep_result = optimiser_solve(
             state, goals, weights, config_deep, progress_cb, should_stop,
@@ -4460,6 +4597,7 @@ def _run_optimiser_with_progress(state, goals, weights, mode, max_conc,
 
 
 def _run_pareto(state, goals, base_weights, max_conc, allow_term, allow_expat_hires,
+                window_start_month, window_end_month, enforce_monthly,
                 progress_cb) -> list[dict]:
     """
     Compute a cost-vs-localisation Pareto frontier by solving at several
@@ -4488,6 +4626,9 @@ def _run_pareto(state, goals, base_weights, max_conc, allow_term, allow_expat_hi
             max_concurrent_trainings_per_fleet=max_conc,
             allow_expat_hires=allow_expat_hires,
             allow_terminations=allow_term,
+            window_start_month=window_start_month,
+            window_end_month=window_end_month,
+            enforce_monthly_requirements=enforce_monthly,
         )
         r = optimiser_solve(state, goals, w, cfg, progress_cb, lambda: False)
         if r.objective_value is not None:
