@@ -79,16 +79,34 @@ LOCAL_MONTHLY_MVR = {
 }
 
 # Default per-transition training cost (MVR). User can override per action later.
-DEFAULT_COST_MVR = {
-    "type_rating_external": 1_200_000,
-    "type_rating_internal":   600_000,
-    "command_upgrade":        400_000,
-    "cadet_hire":             800_000,
-    "expat_hire":             250_000,
-    "local_hire_fo":          300_000,
-    "termination":            150_000,  # severance etc.
+# ---------------------------------------------------------------------------
+# Training costs — IASL actual figures
+# ---------------------------------------------------------------------------
+# Source figures (per cohort of 2 pilots, in USD):
+#   External type rating (generic):    USD 64,000 / 2 pilots  = USD 32,000/pilot
+#   Internal type rating (generic):    USD 40,000 / 2 pilots  = USD 20,000/pilot
+#   Command upgrade:                   USD 15,500 / 2 pilots  = USD  7,750/pilot
+#   A320 → A330 type rating:           USD 17,000 / 2 pilots  = USD  8,500/pilot
+# The solver's decision variables are per-pilot binaries, so the model needs
+# per-pilot values. They are multiplied by 2 automatically when two pilots
+# are in the same cohort — cohort discipline is enforced by the
+# max_concurrent_trainings_per_fleet constraint, which typically pairs
+# trainees when feasible.
+COST_USD_PER_PILOT = {
+    "type_rating_external":       32_000,
+    "type_rating_internal":       20_000,
+    "type_rating_a320_to_a330":    8_500,
+    "command_upgrade":             7_750,
+    "compound_upgrade":           16_250,   # A330 FO → A320 CPT: 20k internal TR + 7.75k CU + rounding
+    "cadet_hire":                 32_000,
+    "expat_hire":                 3_000,   # recruitment + relocation only
+    "local_hire_fo":               3_000,   # direct-entry non-cadet (rare)
+    "termination":                 1_000,   # severance + repatriation typical
 }
 
+DEFAULT_COST_MVR = {
+    k: v * MVR_PER_USD for k, v in COST_USD_PER_PILOT.items()
+}
 
 # ---------------------------------------------------------------------------
 # Career progression graph — allowed transitions
@@ -138,21 +156,30 @@ class OptimiserGoal:
 @dataclass
 class OptimiserWeights:
     cost: float = 1.0
-    expat_months: float = 5000.0       # multiply by MVR/month equivalent
-    shortfall: float = 10_000_000.0     # very large penalty per pilot-month short
-    local_added: float = -500_000.0    # bonus per new local
-    time_to_target: float = 50_000.0   # soft penalty on each month past target
-
+    expat_months: float = 5000.0
+    shortfall: float = 10_000_000.0
+    local_added: float = -500_000.0
+    time_to_target: float = 50_000.0
+    expat_hire_penalty: float = 5_000_000.0
+    # Very large per-hire penalty discouraging bridge expat hires. Combined with
+    # the expat contract horizon constraint below, this makes the solver only
+    # hire expats when genuinely unavoidable for meeting a hard goal.
 
 @dataclass
 class OptimiserConfig:
-    mode: str = "fast"                  # "fast" (30s) or "deep" (600s)
+    mode: str = "fast"
     time_limit_seconds: int = 30
     max_concurrent_trainings_per_fleet: int = 2
     allow_expat_hires: bool = True
     allow_terminations: bool = True
+    expat_hire_contract_months: int = 24
+    # Any expat the solver chooses to hire is automatically terminated
+    # after this many months. Enforces the company rule that expats are
+    # a bridge, not a permanent solution.
+    strategy: str = "cost"
+    # "cost": minimise total programme cost (training + salaries + hiring)
+    # "time": minimise time to target (meet goals as fast as possible)
     seed: int = 42
-
 
 @dataclass
 class SolverProgress:
@@ -200,14 +227,27 @@ def _pilot_eligible_transitions(pilot: Pilot) -> list[tuple[str, str, str, int]]
     return options
 
 
-def _action_cost_mvr(transition_type: str, training_mode: str = "External") -> float:
+def _action_cost_mvr(
+    transition_type: str,
+    from_fleet: str = "",
+    to_fleet: str = "",
+    training_mode: str = "External",
+) -> float:
+    """
+    Per-pilot training / transition cost in MVR.
+    The A320 → A330 type rating has a specific lower cost; all other type
+    ratings fall under the generic external / internal rates.
+    """
     if transition_type == "Type Rating":
-        return DEFAULT_COST_MVR["type_rating_external"] if training_mode == "External" \
-            else DEFAULT_COST_MVR["type_rating_internal"]
+        if from_fleet == "A320" and to_fleet == "A330":
+            return DEFAULT_COST_MVR["type_rating_a320_to_a330"]
+        return (DEFAULT_COST_MVR["type_rating_external"]
+                if training_mode == "External"
+                else DEFAULT_COST_MVR["type_rating_internal"])
     if transition_type == "Command Upgrade":
         return DEFAULT_COST_MVR["command_upgrade"]
     if transition_type == "Compound Upgrade":
-        return DEFAULT_COST_MVR["type_rating_internal"] + DEFAULT_COST_MVR["command_upgrade"]
+        return DEFAULT_COST_MVR["compound_upgrade"]
     return 0.0
 
 
@@ -520,7 +560,11 @@ def solve(
         p = next((pl for pl in local_pilots if pl.employee_id == pid), None)
         if not p: continue
         transition_type = _transition_action_type(p.fleet, p.function, tf, tfn)
-        cost = _action_cost_mvr(transition_type, training_mode="External")
+        cost = _action_cost_mvr(
+            transition_type,
+            from_fleet=p.fleet, to_fleet=tf,
+            training_mode="External",
+        )
         obj_cost_terms.append(cost * var)
 
     # Hire cost
@@ -578,15 +622,33 @@ def solve(
             obj_local_terms.append(weights.local_added * hvar)
     # Also count transitions as "adding a local to higher role"
     for (pid, tf, tfn, sm), var in x_TR.items():
-        obj_local_terms.append(weights.local_added * var * 0.3)  # smaller bonus for promotion
+        obj_local_terms.append(weights.local_added * var * 0.3)
+
+    # Expat-hire penalty — strong discouragement of bridge expat hires
+    obj_expat_hire_terms = []
+    for (hf, hfn, hnat, hsm), hvar in x_HIRE.items():
+        if hnat == "Expat":
+            obj_expat_hire_terms.append(weights.expat_hire_penalty * hvar)
+
+    # Time-to-target penalty — we approximate this by penalising shortfalls
+    # that persist into later months (so meeting goals EARLIER is cheaper).
+    # For "time" strategy we scale this up; for "cost" strategy it stays low.
+    obj_time_terms = []
+    if weights.time_to_target > 0:
+        for (f, fn, m), svar in short.items():
+            # Later months are penalised more heavily
+            month_weight = (m + 1) / horizon  # 1/h to 1.0
+            obj_time_terms.append(weights.time_to_target * month_weight * svar)
 
     # Assemble
     prob += (
         weights.cost * pulp.lpSum(obj_cost_terms)
-        + pulp.lpSum(obj_expat_terms)  # expat salary savings pre-weighted by weights.expat_months
+        + pulp.lpSum(obj_expat_terms)
         + pulp.lpSum(obj_short_terms)
         + pulp.lpSum(obj_goal_terms)
         + pulp.lpSum(obj_local_terms)
+        + pulp.lpSum(obj_expat_hire_terms)
+        + pulp.lpSum(obj_time_terms)
     )
 
     # ------------------------------------------------------------------
@@ -641,7 +703,11 @@ def solve(
     # ------------------------------------------------------------------
     # EXTRACT ACTIONS
     # ------------------------------------------------------------------
-    actions = _extract_actions(x_TR, x_HIRE, x_TERM, local_pilots, expat_pilots)
+    actions = _extract_actions(
+        x_TR, x_HIRE, x_TERM, local_pilots, expat_pilots,
+        expat_contract_months=config.expat_hire_contract_months,
+        horizon=horizon,
+    )
 
     # Shortfall summary
     per_month_short: dict[tuple[str, str], list[float]] = {}
@@ -691,7 +757,9 @@ def _transition_action_type(from_fleet, from_function, to_fleet, to_function):
     return "Type Rating"
 
 
-def _extract_actions(x_TR, x_HIRE, x_TERM, local_pilots, expat_pilots) -> list[PlannedAction]:
+def _extract_actions(x_TR, x_HIRE, x_TERM, local_pilots, expat_pilots,
+                     expat_contract_months: int = 24,
+                     horizon: int = 24) -> list[PlannedAction]:
     import pulp
     acts: list[PlannedAction] = []
 
@@ -706,7 +774,11 @@ def _extract_actions(x_TR, x_HIRE, x_TERM, local_pilots, expat_pilots) -> list[P
         atype = _transition_action_type(p.fleet, p.function, tf, tfn)
         dur = _transition_duration(p.fleet, p.function, tf, tfn) or 1
 
-        cost = _action_cost_mvr(atype, training_mode="External")
+        cost = _action_cost_mvr(
+            atype,
+            from_fleet=p.fleet, to_fleet=tf,
+            training_mode="External",
+        )
 
         if atype == "Compound Upgrade":
             # Represent as a single action with compound note
@@ -739,28 +811,57 @@ def _extract_actions(x_TR, x_HIRE, x_TERM, local_pilots, expat_pilots) -> list[P
             ))
 
     # Hires
+    # Hires — with auto-termination for solver-scheduled expat hires
+    contract_termination_marker = []  # list of (hire_action_id, termination_month)
     for (hf, hfn, hnat, hsm), hvar in x_HIRE.items():
         n_hires = int(round(pulp.value(hvar) or 0))
-        for _ in range(n_hires):
+        for h_i in range(n_hires):
             dur = TRAINING_DURATIONS["cadet_atr_fo"] if hnat == "Local" else 0
             cost = DEFAULT_COST_MVR["cadet_hire"] if hnat == "Local" else DEFAULT_COST_MVR["expat_hire"]
-            if hnat == "Local":
-                atype = "Cadet Hire"
-            else:
-                atype = "Expat Hire"
+            atype = "Cadet Hire" if hnat == "Local" else "Expat Hire"
+
+            hire_action_id = new_id("opt")
+            placeholder_pilot_id = f"TBD-OPT-{hire_action_id[-8:]}-{h_i}"
+
             acts.append(PlannedAction(
-                id=new_id("opt"),
+                id=hire_action_id,
                 action_type=atype,
                 start_month=hsm,
                 duration=dur,
                 mode="—",
                 to_fleet=hf, to_function=hfn,
-                new_pilot_name="TBD (OPT)",
+                new_pilot_name=f"TBD ({atype} #{h_i + 1})",
                 new_pilot_nationality=hnat,
-                note="[OPT] Optimiser-generated hire",
+                note=(
+                    f"[OPT] Optimiser-generated hire. "
+                    f"Auto-terminates after {expat_contract_months} months."
+                    if hnat == "Expat"
+                    else "[OPT] Optimiser-generated local hire."
+                ),
                 cost=cost,
                 cost_currency="MVR",
+                trainee_ids=[placeholder_pilot_id] if hnat == "Expat" else [],
             ))
+
+            # For expat hires, schedule an auto-termination at end of contract
+            if hnat == "Expat":
+                arrival_month = hsm + dur
+                term_month = arrival_month + expat_contract_months
+                if term_month < horizon:
+                    acts.append(PlannedAction(
+                        id=new_id("opt"),
+                        action_type="Pilot Termination",
+                        start_month=term_month,
+                        duration=0,
+                        mode="—",
+                        trainee_ids=[placeholder_pilot_id],
+                        note=(
+                            f"[OPT] Auto-termination of optimiser-hired expat "
+                            f"after {expat_contract_months}-month contract."
+                        ),
+                        cost=DEFAULT_COST_MVR["termination"],
+                        cost_currency="MVR",
+                    ))
 
     # Terminations — batch same-month terminations into single actions
     term_by_month: dict[int, list[str]] = {}
