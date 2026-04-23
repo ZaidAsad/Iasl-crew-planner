@@ -4558,14 +4558,20 @@ def _render_optimiser_gantt(actions, d):
         start_lbl = labels[a.start_month] if 0 <= a.start_month < len(labels) else "?"
         end_idx = min(a.start_month + int(round(dur)), len(labels) - 1)
         end_lbl = labels[end_idx]
-        col = color_map.get(a.action_type, COLORS["muted"])
+        col = color_map.get(a.action_type, COLORS["text_muted"])
 
-        pilots_str = ", ".join(
-            pilot_by_id.get(t, Pilot(
-                employee_id=t, full_name=t, nationality="", fleet="",
-                function="", designations=[], management=False, status="",
-            )).full_name for t in a.trainee_ids[:3]
-        )
+        trainee_display = []
+        for t in a.trainee_ids[:3]:
+            if t.startswith("SEAT:"):
+                pid = t[5:]
+                p = pilot_by_id.get(pid)
+                trainee_display.append(f"{p.full_name} (SS)" if p else f"{pid} (SS)")
+            elif t.startswith("TBD"):
+                trainee_display.append(t)
+            else:
+                p = pilot_by_id.get(t)
+                trainee_display.append(p.full_name if p else t)
+        pilots_str = ", ".join(trainee_display)
         if len(a.trainee_ids) > 3:
             pilots_str += f" +{len(a.trainee_ids) - 3}"
 
