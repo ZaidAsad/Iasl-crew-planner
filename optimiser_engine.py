@@ -175,12 +175,13 @@ class OptimiserConfig:
     allow_terminations: bool = True
     expat_hire_contract_months: int = 24
     strategy: str = "cost"
-    # Window of months the solver may plan within. If end < 0, defaults to horizon-1.
     window_start_month: int = 0
     window_end_month: int = -1
-    # If True, monthly requirements must be met at every month in the window.
-    # If False, only goals' target_month need be met; intermediate shortfalls
-    # are penalised softly but not forbidden.
+    # Extend the solver's month space beyond the main app horizon. The main
+    # planning horizon (from state["horizon"]) stays unchanged — this is
+    # purely solver-internal. If 0 or negative, the solver uses the main
+    # horizon as-is.
+    solver_horizon_override_months: int = 0
     enforce_monthly_requirements: bool = True
     seed: int = 42
 
@@ -274,12 +275,29 @@ def solve(
     """
     import pulp
 
-    horizon = state["horizon"]
+    app_horizon = state["horizon"]
     pilots: list[Pilot] = state["pilots"]
     existing_actions: list[PlannedAction] = list(state["actions"])
-    ac_counts = resolve_aircraft_counts(
-        state["initial_aircraft"], state["fleet_changes"], horizon)
+
+    # The solver horizon may extend beyond the main app horizon. Everything
+    # downstream (labels, aircraft counts, requirement arrays, availability
+    # arrays) is extended by projecting the last known value forward.
+    override = config.solver_horizon_override_months
+    if override and override > 0:
+        horizon = max(app_horizon, override)
+    else:
+        horizon = app_horizon
+
+    ac_counts_base = resolve_aircraft_counts(
+        state["initial_aircraft"], state["fleet_changes"], app_horizon)
+    ac_counts = {}
+    for f in FLEETS:
+        series = list(ac_counts_base[f])
+        while len(series) < horizon:
+            series.append(series[-1] if series else 0)
+        ac_counts[f] = series
     requirement = fleet_requirement(ac_counts)
+
     labels = month_labels(state["start_year"], state["start_month"], horizon)
 
     # Normalise window
@@ -1175,18 +1193,32 @@ def _build_explanation(status, obj_val, elapsed, actions, total_short, goals,
     return "\n".join(lines)
 
 
-def preview_window_state(state: dict, window_start_month: int) -> dict:
+def preview_window_state(
+    state: dict,
+    window_start_month: int,
+    solver_horizon: int | None = None,
+) -> dict:
     """
-    Return a human-friendly summary of the crew state at the start of the
-    solver window — i.e., what the solver will treat as the starting point.
-    Used by the UI to show "this is what you're optimising from".
+    Return a human-friendly summary of the crew state at the given month.
+    If solver_horizon is given and exceeds state['horizon'], arrays are
+    extended by forward-projecting the last value.
     """
     pilots: list[Pilot] = state["pilots"]
     existing_actions: list[PlannedAction] = state["actions"]
-    horizon = state["horizon"]
+    app_horizon = state["horizon"]
 
-    ac_counts = resolve_aircraft_counts(
-        state["initial_aircraft"], state["fleet_changes"], horizon)
+    horizon = app_horizon
+    if solver_horizon and solver_horizon > app_horizon:
+        horizon = solver_horizon
+
+    ac_counts_base = resolve_aircraft_counts(
+        state["initial_aircraft"], state["fleet_changes"], app_horizon)
+    ac_counts = {}
+    for f in FLEETS:
+        series = list(ac_counts_base[f])
+        while len(series) < horizon:
+            series.append(series[-1] if series else 0)
+        ac_counts[f] = series
     requirement = fleet_requirement(ac_counts)
     availability = compute_availability(pilots, existing_actions, horizon)
 
